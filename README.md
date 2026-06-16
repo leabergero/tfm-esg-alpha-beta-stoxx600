@@ -1,7 +1,7 @@
 # TFM: Impacto del Desempeño ESG en Alpha y Beta — STOXX 600
 
 **Autor:** Leandro Bergero  
-**Universidad:** UPF (Master en Finanzas)  
+**Universidad:** BSM - UPF (Master en Finanzas)  
 **Período:** 2015-2025  
 **Última actualización:** junio 2026
 
@@ -147,7 +147,7 @@ Si utilizas este trabajo, por favor cita:
 @mastersthesis{bergero2026esg,
   author = {Bergero, Leandro},
   title = {Impacto del desempeño ESG en Alpha y Beta de empresas del STOXX 600},
-  school = {Universitat Autònoma de Barcelona, Master en Finanzas},
+  school = {BSM UNIV. POMPEU FABRA, Master en Finanzas y Banca},
   year = {2026}
 }
 ```
