@@ -1,0 +1,585 @@
+# ==============================================================================
+# SCRIPT 3.4 (v2): HIPÓTESIS 3 — RIESGO DINÁMICO (MARKOV-SWITCHING CAPM)
+# ==============================================================================
+#
+# PREGUNTA: ¿El alto desempeño ESG reduce el riesgo sistemático (Beta)
+# exclusivamente en períodos de crisis o alta volatilidad de mercado?
+# ("ESG como activo refugio")
+#
+# DISEÑO EN DOS ETAPAS (v2):
+#
+#   ETAPA 1 — Detección de regímenes sobre el MERCADO (retornos DIARIOS):
+#     R_mt = μ_St + ε_t,  ε_t ~ N(0, σ²_St),  St ∈ {calma, crisis}
+#     Markov-Switching (statsmodels MarkovRegression) sobre el retorno DIARIO
+#     del STOXX 600 (~2.500 obs): la frecuencia diaria identifica los clusters
+#     de volatilidad (COVID 2020, inflación 2022) con mucha más precisión que
+#     la mensual, donde solo el episodio COVID resulta detectable.
+#     El régimen con mayor σ² se etiqueta CRISIS.
+#     → Agregación a mensual: P(crisis) media del mes; D_crisis = 1 si > 0.5
+#
+#   ETAPA 2 — CAPM condicional por portafolio (OLS + Newey-West):
+#     R_pt − R_ft = α + γ·D_t + β·(Rm_Rf)_t + δ·[D_t × (Rm_Rf)_t] + ε_pt
+#     β_calma = β | β_crisis = β + δ | Δβ = δ
+#     Test de Wald H0: β_calma = β_crisis ⇔ H0: δ = 0 (χ² = t²_NW)
+#
+# POR QUÉ DOS ETAPAS Y FRECUENCIA DIARIA (nota metodológica para el TFM):
+#   (a) La estimación MS directa sobre cada portafolio (α, β y σ² cambiantes,
+#   120 obs mensuales) degenera: la verosimilitud diverge cuando un régimen
+#   colapsa sobre un único mes con σ²→0 (problema conocido de mezclas
+#   gaussianas). Además, regímenes estimados por separado en cada portafolio
+#   no son comparables entre Q1 y Q5.
+#   (b) El MS sobre el mercado en frecuencia MENSUAL converge pero solo
+#   detecta como crisis el episodio COVID (4-5 meses) — insuficiente para
+#   el test de interacción. Con retornos DIARIOS los clusters de volatilidad
+#   se identifican con precisión y la clasificación mensual resultante tiene
+#   masa suficiente en ambos regímenes.
+#   Detectar el régimen sobre el mercado (común a todos los portafolios) y
+#   estimar el CAPM condicional con interacción es práctica estándar en la
+#   literatura de betas condicionales.
+#
+# CRITERIO DE DECISIÓN (guía HITO 3):
+#   Zona Verde:  δ < 0 significativo en Q1 (mejor ESG) Y no en Q5
+#                → el ESG reduce el beta en crisis (Kossentini et al. 2024)
+#   Efecto general: δ < 0 significativo en Q1 Y Q5 → flight to quality
+#                del mercado, no atribuible al ESG
+#   Zona Roja:   δ no significativo → el ESG no da inmunidad
+#                (Elvira et al. 2025)
+#
+# REQUIERE: ports_raw (Script 3.2) + df_factors_4f (Script 3.1) en memoria
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+from scipy import stats
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT 3.4 (v2): HIPÓTESIS 3 — MS-CAPM EN DOS ETAPAS")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, nombre in [('ports_raw',     'Script 3.2'),
+                    ('df_factors_4f', 'Script 3.1'),
+                    ('df_stoxx',      'Script 2 principal (Sección 5)')]:
+    if var not in dir():
+        print(f"❌ '{var}' no está en memoria. Ejecuta {nombre} primero.")
+        raise SystemExit
+
+if 'STOXX_VERSION' not in dir():
+    STOXX_VERSION = 'versión no identificada'
+
+print(f"Índice de mercado: STOXX 600 [{STOXX_VERSION}]")
+
+SCORES = ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']
+SCORE_LABELS = {'ESG_Score': 'ESG Compuesto', 'E_Score': 'Pilar E',
+                'S_Score': 'Pilar S', 'G_Score': 'Pilar G'}
+CARTERAS = ['Q1', 'Q5', 'Q1-Q5']
+
+np.random.seed(42)
+
+
+def sig_stars(p):
+    if   p < 0.01: return '***'
+    elif p < 0.05: return '**'
+    elif p < 0.10: return '*'
+    else:          return ''
+
+# ==============================================================================
+# SECCIÓN 1: ETAPA 1 — DETECCIÓN DE REGÍMENES (RETORNOS DIARIOS DEL MERCADO)
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 1: Markov-Switching sobre el retorno DIARIO del STOXX 600")
+print("─" * 80)
+
+# Serie mensual del mercado (para gráficos y referencia)
+mkt = df_factors_4f[['Date', 'YearMonth', 'Rm_Rf']].dropna().sort_values('Date')
+rm_serie = pd.Series(mkt['Rm_Rf'].values,
+                     index=pd.DatetimeIndex(mkt['Date']), name='Rm_Rf')
+
+# Serie DIARIA del índice, restringida a la ventana de la muestra mensual
+fecha_ini = rm_serie.index.min()
+ret_d = df_stoxx[['Date', 'Return']].dropna().copy()
+ret_d['Date'] = pd.to_datetime(ret_d['Date'])
+ret_d = ret_d[ret_d['Date'] >= fecha_ini].sort_values('Date')
+rm_diario = pd.Series(ret_d['Return'].values,
+                      index=pd.DatetimeIndex(ret_d['Date']), name='Rm_diario')
+
+print(f"\n  Serie diaria del mercado: {len(rm_diario):,} días "
+      f"({rm_diario.index.min().date()} → {rm_diario.index.max().date()})")
+print(f"  Media: {rm_diario.mean()*100:.4f}%/día | Desv: {rm_diario.std()*100:.4f}%/día")
+print(f"  Serie mensual (Etapa 2): {len(rm_serie)} meses")
+
+print("\n  Estimando MS(2) sobre retornos diarios (media + varianza cambiantes)...")
+print("  (la frecuencia diaria identifica los clusters de volatilidad con precisión)")
+
+res_mkt = None
+for intento, switching_trend in [('media+varianza', True), ('solo varianza', False)]:
+    try:
+        mod_mkt = MarkovRegression(rm_diario, k_regimes=2, trend='c',
+                                   switching_trend=switching_trend,
+                                   switching_variance=True)
+        cand = mod_mkt.fit(search_reps=10)
+        nombres = cand.model.param_names
+        p_cand = cand.params
+        idx = {n: i for i, n in enumerate(nombres)}
+        s2 = np.array([p_cand[idx['sigma2[0]']], p_cand[idx['sigma2[1]']]])
+        reg_crisis = int(np.argmax(s2))
+        prob_d = cand.smoothed_marginal_probabilities[reg_crisis]
+        n_crisis_d = int((prob_d > 0.5).sum())
+        # Validación: ambos regímenes con masa razonable (≥30 días) y σ² sana
+        if min(n_crisis_d, len(rm_diario) - n_crisis_d) >= 30 and s2.min() > 1e-10:
+            res_mkt = cand
+            REGIMEN_CRISIS = reg_crisis
+            prob_crisis_d = prob_d
+            print(f"  ✅ Convergió con especificación: {intento} "
+                  f"({n_crisis_d} días en crisis)")
+            break
+        else:
+            print(f"  ⚠️  Especificación '{intento}' degenerada "
+                  f"(días crisis={n_crisis_d}, σ²min={s2.min():.2e}) — probando fallback...")
+    except Exception as e:
+        print(f"  ⚠️  Especificación '{intento}' no convergió ({e}) — probando fallback...")
+
+if res_mkt is None:
+    print("❌ El MS del mercado no produjo regímenes válidos. Revisar datos.")
+    raise SystemExit
+
+nombres = res_mkt.model.param_names
+p_mkt = res_mkt.params
+idx = {n: i for i, n in enumerate(nombres)}
+REGIMEN_CALMA = 1 - REGIMEN_CRISIS
+
+sigma2_mkt = np.array([p_mkt[idx['sigma2[0]']], p_mkt[idx['sigma2[1]']]])
+
+if f'const[{REGIMEN_CALMA}]' in idx:
+    mu_calma  = p_mkt[idx[f'const[{REGIMEN_CALMA}]']]
+    mu_crisis = p_mkt[idx[f'const[{REGIMEN_CRISIS}]']]
+else:
+    mu_calma = mu_crisis = p_mkt[idx['const']]
+
+duraciones = res_mkt.expected_durations
+
+print(f"""
+  PARÁMETROS DEL MERCADO POR RÉGIMEN (frecuencia diaria):
+  {'':>14} {'μ (%/día)':>10} {'σ (%/día)':>10} {'σ anual':>9} {'Dur. esp.':>11} {'Días':>7}
+  {'─'*68}
+  {'CALMA':>14} {mu_calma*100:>10.4f} {np.sqrt(sigma2_mkt[REGIMEN_CALMA])*100:>10.4f} {np.sqrt(sigma2_mkt[REGIMEN_CALMA]*252)*100:>8.1f}% {duraciones[REGIMEN_CALMA]:>8.1f} d {len(rm_diario)-int((prob_crisis_d > 0.5).sum()):>7,}
+  {'CRISIS':>14} {mu_crisis*100:>10.4f} {np.sqrt(sigma2_mkt[REGIMEN_CRISIS])*100:>10.4f} {np.sqrt(sigma2_mkt[REGIMEN_CRISIS]*252)*100:>8.1f}% {duraciones[REGIMEN_CRISIS]:>8.1f} d {int((prob_crisis_d > 0.5).sum()):>7,}
+""")
+
+# ── Agregación a frecuencia mensual ────────────────────────────────────────────
+# P(crisis) del mes = media de las probabilidades diarias del mes
+prob_m = prob_crisis_d.groupby(prob_crisis_d.index.to_period('M')).mean()
+D_crisis_m = (prob_m > 0.5).astype(int)
+fechas_m = prob_m.index.to_timestamp()
+
+prob_crisis_mkt = pd.Series(prob_m.values, index=fechas_m, name='P_crisis')
+D_crisis = pd.Series(D_crisis_m.values, index=fechas_m, name='D_crisis')
+en_crisis_bool = D_crisis.astype(bool)
+
+print(f"  AGREGACIÓN MENSUAL: P(crisis) media del mes > 0.5 → mes en crisis")
+print(f"  Meses en crisis: {int(D_crisis.sum())} de {len(D_crisis)}")
+
+# Episodios de crisis detectados (mensual)
+episodios = []
+inicio = None
+fechas = prob_crisis_mkt.index
+for i, (fecha, es_c) in enumerate(zip(fechas, en_crisis_bool)):
+    if es_c and inicio is None:
+        inicio = fecha
+    elif not es_c and inicio is not None:
+        episodios.append((inicio, fechas[i-1]))
+        inicio = None
+if inicio is not None:
+    episodios.append((inicio, fechas[-1]))
+
+print("\n  EPISODIOS DE CRISIS DETECTADOS (meses con P(crisis) > 0.5):")
+for ini, fin in episodios:
+    n_m = ((fin.year - ini.year) * 12 + fin.month - ini.month) + 1
+    print(f"    {ini.strftime('%Y-%m')} → {fin.strftime('%Y-%m')}  ({n_m} meses)")
+
+print("""
+  Validación de credibilidad: episodios esperables a priori en 2016-2025 —
+  corrección dic-2018, COVID (feb-jun 2020), inflación/guerra Ucrania (2022).
+  La coincidencia con estos eventos respalda la detección endógena.
+""")
+
+# ==============================================================================
+# SECCIÓN 2: ETAPA 2 — CAPM CONDICIONAL POR PORTAFOLIO (OLS + NEWEY-WEST)
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 2: CAPM condicional — R_p−R_f = α + γ·D + β·Rm_Rf + δ·(D×Rm_Rf)")
+print("─" * 80)
+
+print("""
+  β_calma = β | β_crisis = β + δ | Δβ = δ
+  Test de Wald H0: β_calma = β_crisis ⇔ H0: δ = 0 (χ² = t²; t con Newey-West 3 lags)
+""")
+
+# Tabla de regímenes para merge por fecha
+df_regimen = pd.DataFrame({
+    'Date': prob_crisis_mkt.index,
+    'D_crisis': D_crisis.values,
+    'P_crisis': prob_crisis_mkt.values
+})
+
+
+def capm_condicional(score, cartera):
+    """Estima el CAPM condicional con dummy de crisis del mercado."""
+    df_p = ports_raw[score].merge(
+        df_factors_4f[['YearMonth', 'Rm_Rf']],
+        on='YearMonth', how='inner'
+    )
+    df_p['Date'] = pd.to_datetime(df_p['Date'])
+    df_p = df_p.merge(df_regimen, on='Date', how='inner')
+
+    ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+    datos = df_p[['Date', ret_col, 'Rm_Rf', 'D_crisis']].dropna().sort_values('Date')
+
+    if len(datos) < 24:
+        return None
+
+    datos['D_x_Rm'] = datos['D_crisis'] * datos['Rm_Rf']
+    Y = datos[ret_col].values
+    X = sm.add_constant(datos[['D_crisis', 'Rm_Rf', 'D_x_Rm']].values)
+
+    modelo_nw = sm.OLS(Y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+    modelo    = sm.OLS(Y, X).fit()
+
+    alpha, gamma, beta, delta = modelo_nw.params
+    t_delta = modelo_nw.tvalues[3]
+    p_delta = modelo_nw.pvalues[3]
+
+    return {
+        'score': score, 'cartera': cartera, 'n': len(datos),
+        'alpha_calma': alpha, 'alpha_crisis': alpha + gamma,
+        'gamma': gamma, 't_gamma': modelo_nw.tvalues[1], 'p_gamma': modelo_nw.pvalues[1],
+        'beta_calma': beta, 't_beta': modelo_nw.tvalues[2],
+        'delta': delta, 't_delta': t_delta, 'p_delta': p_delta,
+        'beta_crisis': beta + delta,
+        'wald': t_delta**2,
+        'R2': modelo.rsquared, 'R2_adj': modelo.rsquared_adj,
+        'modelo_nw': modelo_nw, 'datos': datos,
+    }
+
+
+resultados_h3 = {}
+for score in SCORES:
+    for cartera in CARTERAS:
+        r = capm_condicional(score, cartera)
+        if r is not None:
+            resultados_h3[(score, cartera)] = r
+
+print(f"  ✅ Modelos estimados: {len(resultados_h3)} / {len(SCORES) * len(CARTERAS)}")
+
+# ── TABLA 2A: parámetros del CAPM condicional ─────────────────────────────────
+print("\n" + "═" * 80)
+print("TABLA 2A — CAPM CONDICIONAL POR RÉGIMEN (OLS + Newey-West)")
+print("═" * 80)
+
+for score in SCORES:
+    print(f"\n  {SCORE_LABELS[score]}")
+    print(f"  {'Cartera':<8} {'α_calma%':>9} {'α_crisis%':>10} {'β_calma':>8} {'β_crisis':>9} "
+          f"{'Δβ (δ)':>8} {'t(δ)':>7} {'p(δ)':>8} {'Sig':>4} {'R²':>6}")
+    print(f"  {'─'*86}")
+    for cartera in CARTERAS:
+        r = resultados_h3.get((score, cartera))
+        if r is None:
+            continue
+        stars = sig_stars(r['p_delta'])
+        print(f"  {cartera:<8} {r['alpha_calma']*100:>9.3f} {r['alpha_crisis']*100:>10.3f} "
+              f"{r['beta_calma']:>8.3f} {r['beta_crisis']:>9.3f} "
+              f"{r['delta']:>8.3f} {r['t_delta']:>7.2f} {r['p_delta']:>8.4f} {stars:>4} {r['R2']:>6.3f}")
+
+# ==============================================================================
+# SECCIÓN 3: TEST DE WALD — ¿β DISTINTAS ENTRE REGÍMENES?
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 3: Test de Wald — H0: β_calma = β_crisis (χ² = t²(δ), Newey-West)")
+print("─" * 80)
+
+print(f"""
+  Umbral (guía HITO 3): Wald χ² > 3.84 (p < 0.05) → betas distintas por régimen.
+  Dirección refugio: δ < 0 (el beta CAE en crisis).
+""")
+
+print(f"  {'Score':<15} {'Cartera':<8} {'β_calma':>8} {'β_crisis':>9} {'Δβ=δ':>8} "
+      f"{'Wald χ²':>9} {'p':>8} {'Sig':>4}  Dirección")
+print(f"  {'─'*88}")
+
+for score in SCORES:
+    for cartera in CARTERAS:
+        r = resultados_h3.get((score, cartera))
+        if r is None:
+            continue
+        stars = sig_stars(r['p_delta'])
+        if r['p_delta'] < 0.05:
+            direccion = "β cae en crisis (refugio)" if r['delta'] < 0 else "β SUBE en crisis"
+        else:
+            direccion = "betas iguales"
+        print(f"  {SCORE_LABELS[score]:<15} {cartera:<8} {r['beta_calma']:>8.3f} {r['beta_crisis']:>9.3f} "
+              f"{r['delta']:>8.3f} {r['wald']:>9.3f} {r['p_delta']:>8.4f} {stars:>4}  {direccion}")
+
+# ==============================================================================
+# SECCIÓN 4: DECISIÓN H3 SEGÚN PROTOCOLO HITO 3
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 4: Decisión H3 según protocolo HITO 3")
+print("─" * 80)
+
+r_q1 = resultados_h3.get(('ESG_Score', 'Q1'))
+r_q5 = resultados_h3.get(('ESG_Score', 'Q5'))
+
+if r_q1 is not None and r_q5 is not None:
+    q1_sig     = r_q1['p_delta'] < 0.05
+    q1_refugio = q1_sig and r_q1['delta'] < 0
+    q5_sig     = r_q5['p_delta'] < 0.05
+    q5_refugio = q5_sig and r_q5['delta'] < 0
+
+    print(f"""
+  Q1 (mejor ESG):  β_calma = {r_q1['beta_calma']:.3f} → β_crisis = {r_q1['beta_crisis']:.3f}  (δ = {r_q1['delta']:+.3f})
+                   Wald = {r_q1['wald']:.3f} (p = {r_q1['p_delta']:.4f}) → {'significativo' if q1_sig else 'NO significativo'}
+  Q5 (peor ESG):   β_calma = {r_q5['beta_calma']:.3f} → β_crisis = {r_q5['beta_crisis']:.3f}  (δ = {r_q5['delta']:+.3f})
+                   Wald = {r_q5['wald']:.3f} (p = {r_q5['p_delta']:.4f}) → {'significativo' if q5_sig else 'NO significativo'}
+
+  RESULTADO:
+""")
+
+    q5_amplifica = q5_sig and r_q5['delta'] > 0
+
+    if q1_refugio and not q5_refugio:
+        print("  ✅ ZONA VERDE: el beta de Q1 cae en crisis y el de Q5 no →")
+        print("     el alto desempeño ESG actúa como refugio en pánicos bursátiles")
+        print("     (consistente con Kossentini et al. 2024)")
+    elif q1_refugio and q5_refugio:
+        print("  🟡 EFECTO GENERAL, NO ESG: ambos quintiles reducen beta en crisis →")
+        print("     flight to quality generalizado del mercado, no atribuible al ESG.")
+        print("     H3 NO se confirma como efecto diferencial del ESG.")
+    elif not q1_sig and q5_amplifica:
+        print("  🟠 HALLAZGO ESPECULAR — PROTECCIÓN RELATIVA DEL ESG:")
+        print("     El beta de Q1 (mejor ESG) se mantiene ESTABLE entre regímenes,")
+        print("     pero el de Q5 (peor ESG) AUMENTA significativamente en crisis.")
+        print("     → H3 se RECHAZA en su formulación original (el ESG alto no")
+        print("       reduce su beta en crisis — no es refugio absoluto), PERO el")
+        print("       bajo desempeño ESG sí AMPLIFICA el riesgo sistemático en")
+        print("       crisis. El ESG protege en términos RELATIVOS: evita la")
+        print("       amplificación del riesgo que sufren las empresas low-ESG.")
+        print("     → Coherente con el riesgo 'brown' (Bolton & Kacperczyk 2021):")
+        print("       el riesgo de transición de las low-ESG se materializa con")
+        print("       mayor intensidad en los episodios de estrés del mercado.")
+    elif not q1_sig and not q5_sig:
+        print("  🔴 ZONA ROJA: betas estadísticamente iguales entre regímenes →")
+        print("     el ESG no da inmunidad ante crisis; las inversiones sostenibles")
+        print("     siguen sujetas a los mismos riesgos sistemáticos")
+        print("     (consistente con Elvira et al. 2025)")
+    else:
+        print("  🟡 RESULTADO MIXTO: revisar tabla de Wald (Sección 3) — la evidencia")
+        print("     no es concluyente en la dirección esperada por H3.")
+
+    # Lectura complementaria: el L-S
+    r_ls = resultados_h3.get(('ESG_Score', 'Q1-Q5'))
+    if r_ls is not None:
+        print(f"""
+  Lectura complementaria (L-S ESG): δ = {r_ls['delta']:+.3f} (p = {r_ls['p_delta']:.4f})
+  El δ del L-S mide directamente la DIFERENCIA de sensibilidad al régimen
+  entre Q1 y Q5: δ_LS < 0 significativo indicaría que el spread defensivo
+  del ESG mejora en crisis.""")
+
+# ==============================================================================
+# SECCIÓN 5: GRÁFICOS
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print(f"SECCIÓN 5: Gráficos — H3 [{STOXX_VERSION}]")
+print("─" * 80)
+
+import os
+RUTA_GRAFICOS = '/content/drive/MyDrive/TFM_STOXX600/HITO4'
+os.makedirs(RUTA_GRAFICOS, exist_ok=True)
+
+# ── Gráfico 1: Régimen del mercado — P(crisis) + Rm_Rf ────────────────────────
+print("\n  Gráfico 1: Regímenes del mercado (P(crisis) + Rm_Rf)...")
+
+fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True,
+                          gridspec_kw={'height_ratios': [1.5, 1]})
+fig.suptitle('H3: Regímenes del mercado detectados endógenamente\n'
+             f'MS(2) sobre retornos diarios — STOXX 600 {STOXX_VERSION} — 2016–2025',
+             fontsize=12, fontweight='bold')
+
+ax1 = axes[0]
+ax1.bar(rm_serie.index, rm_serie * 100, width=22, color=np.where(
+    en_crisis_bool.values, '#d73027', '#74add1'), alpha=0.85)
+ax1.axhline(0, color='black', linewidth=0.7)
+ax1.set_ylabel('Rm_Rf (%/mes)')
+ax1.set_title('Prima de mercado mensual (rojo = mes clasificado en crisis)', fontsize=10)
+ax1.grid(True, alpha=0.3)
+
+ax2 = axes[1]
+ax2.fill_between(prob_crisis_d.index, prob_crisis_d, 0, color='#d73027', alpha=0.35)
+ax2.plot(prob_crisis_d.index, prob_crisis_d, color='#d73027', linewidth=0.7)
+ax2.axhline(0.5, color='black', linewidth=0.7, linestyle=':')
+ax2.set_ylabel('P(crisis) diaria')
+ax2.set_xlabel('Año')
+ax2.set_ylim([0, 1])
+ax2.grid(True, alpha=0.3)
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax2.xaxis.set_major_locator(mdates.YearLocator())
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h3_regimen_mercado.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 2: β por régimen — Q1 vs Q5 para los 4 scores ─────────────────────
+print("\n  Gráfico 2: Betas por régimen (Q1 vs Q5, 4 scores)...")
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle('H3: Beta de mercado por régimen — ¿cae el beta del ESG alto en crisis?\n'
+             'CAPM condicional con regímenes del mercado (MS endógeno)',
+             fontsize=12, fontweight='bold')
+
+for ax, score in zip(axes.flatten(), SCORES):
+    r1 = resultados_h3.get((score, 'Q1'))
+    r5 = resultados_h3.get((score, 'Q5'))
+    if r1 is None or r5 is None:
+        continue
+
+    x = np.arange(2)
+    ancho = 0.35
+    ax.bar(x - ancho/2, [r1['beta_calma'], r1['beta_crisis']], ancho,
+           label='Q1 (mejor ESG)', color='#1a9641', edgecolor='black', linewidth=0.5)
+    ax.bar(x + ancho/2, [r5['beta_calma'], r5['beta_crisis']], ancho,
+           label='Q5 (peor ESG)', color='#d73027', edgecolor='black', linewidth=0.5)
+
+    for xi, (v1, v5) in enumerate(zip([r1['beta_calma'], r1['beta_crisis']],
+                                      [r5['beta_calma'], r5['beta_crisis']])):
+        ax.text(xi - ancho/2, v1 + 0.01, f'{v1:.3f}', ha='center', fontsize=8.5)
+        ax.text(xi + ancho/2, v5 + 0.01, f'{v5:.3f}', ha='center', fontsize=8.5)
+
+    ax.axhline(1, color='gray', linewidth=0.7, linestyle=':')
+    ax.set_xticks(x)
+    ax.set_xticklabels(['Calma', 'Crisis'])
+    ax.set_ylabel('β de mercado')
+    ax.set_title(f"{SCORE_LABELS[score]}  |  p(δ): Q1={r1['p_delta']:.3f}, Q5={r5['p_delta']:.3f}",
+                 fontsize=10)
+    ax.legend(fontsize=8.5)
+    ax.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h3_betas_regimen.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 3: Retorno acumulado L-S con regímenes sombreados ─────────────────
+print("\n  Gráfico 3: L-S acumulado con regímenes de crisis sombreados...")
+
+r_ls = resultados_h3.get(('ESG_Score', 'Q1-Q5'))
+if r_ls is not None:
+    datos_ls = r_ls['datos']
+    cum_ls = (1 + datos_ls['EX_LS']).cumprod()
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    ax.plot(datos_ls['Date'], cum_ls, color='#2c3e50', linewidth=1.8,
+            label='L-S ESG acumulado (Q1−Q5)')
+
+    for ini, fin in episodios:
+        ax.axvspan(ini, fin, color='#d73027', alpha=0.18)
+
+    ax.axhline(1, color='black', linewidth=0.7, linestyle=':')
+    ax.set_title('H3: Estrategia Long-Short ESG con regímenes de crisis sombreados\n'
+                 'Sombreado rojo = régimen de crisis del MERCADO (MS endógeno)',
+                 fontsize=12, fontweight='bold')
+    ax.set_ylabel('Retorno acumulado (base = 1)')
+    ax.set_xlabel('Año')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+
+    plt.tight_layout()
+    ruta = f'{RUTA_GRAFICOS}/h3_ls_regimen.png'
+    plt.savefig(ruta, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"   ✅ Guardado: {ruta}")
+
+# ==============================================================================
+# SECCIÓN 6: RESUMEN EJECUTIVO H3
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("RESUMEN EJECUTIVO — HIPÓTESIS 3")
+print("=" * 80)
+
+print(f"""
+  ETAPA 1 — Regímenes del mercado (MS endógeno sobre retornos DIARIOS):
+  · Calma:  μ = {mu_calma*100:+.4f}%/día, σ = {np.sqrt(sigma2_mkt[REGIMEN_CALMA])*100:.4f}%/día (σ anual {np.sqrt(sigma2_mkt[REGIMEN_CALMA]*252)*100:.1f}%)
+  · Crisis: μ = {mu_crisis*100:+.4f}%/día, σ = {np.sqrt(sigma2_mkt[REGIMEN_CRISIS])*100:.4f}%/día (σ anual {np.sqrt(sigma2_mkt[REGIMEN_CRISIS]*252)*100:.1f}%)
+  · Agregación mensual: {int(D_crisis.sum())} meses en crisis de {len(D_crisis)}
+  · Episodios: {', '.join(f"{i.strftime('%Y-%m')}→{f.strftime('%Y-%m')}" for i, f in episodios)}
+""")
+
+print("  ETAPA 2 — Síntesis Wald y dirección (todas las carteras):")
+print(f"  {'Score':<15} {'Cartera':<8} {'Δβ=δ':>8} {'Wald χ²':>9} {'p':>8}   Lectura")
+print(f"  {'─'*68}")
+for score in SCORES:
+    for cartera in CARTERAS:
+        r = resultados_h3.get((score, cartera))
+        if r is None:
+            continue
+        if r['p_delta'] < 0.05:
+            lectura = "refugio" if r['delta'] < 0 else "amplificador"
+        else:
+            lectura = "sin cambio"
+        print(f"  {SCORE_LABELS[score]:<15} {cartera:<8} {r['delta']:>+8.3f} "
+              f"{r['wald']:>9.3f} {r['p_delta']:>8.4f}   {lectura}")
+
+print(f"""
+  Nota metodológica (documentar en el TFM): los regímenes se detectan
+  endógenamente sobre los retornos DIARIOS del mercado (un único MS común a
+  todos los portafolios; la frecuencia diaria identifica los clusters de
+  volatilidad con precisión) y el contraste de betas se realiza en frecuencia
+  mensual vía interacción en el CAPM condicional con errores Newey-West.
+  La estimación MS directa sobre cada portafolio degenera con 120
+  observaciones mensuales (régimen espurio de varianza nula) y produce
+  regímenes no comparables entre carteras; el MS mensual del mercado solo
+  detecta COVID (4-5 meses), insuficiente para el test de interacción.
+""")
+
+print(f"Fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)
+
+# ==============================================================================
+# SECCIÓN 7: ANEXO — SUMMARIES COMPLETOS
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("SECCIÓN 7: ANEXO — Summaries completos")
+print("=" * 80)
+
+print(f"\n{'═'*78}")
+print(f"  ETAPA 1 — Markov-Switching del mercado (régimen {REGIMEN_CRISIS} = crisis)")
+print(f"{'═'*78}")
+print(res_mkt.summary())
+
+for cartera in CARTERAS:
+    r = resultados_h3.get(('ESG_Score', cartera))
+    if r is None:
+        continue
+    print(f"\n{'═'*78}")
+    print(f"  ETAPA 2 — CAPM condicional: ESG Compuesto, Cartera {cartera}")
+    print(f"  Variables: const=α | x1=D_crisis (γ) | x2=Rm_Rf (β) | x3=D×Rm_Rf (δ)")
+    print(f"{'═'*78}")
+    print(r['modelo_nw'].summary())

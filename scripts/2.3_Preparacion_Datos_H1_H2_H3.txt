@@ -1,0 +1,437 @@
+# ==============================================================================
+# SCRIPT 2.3: PREPARACIÓN DE DATOS PARA H1, H2, H3
+# Protocolo de análisis de sensibilidad y robustez
+# ==============================================================================
+#
+# FILOSOFÍA METODOLÓGICA (adoptada tras análisis de outliers):
+#
+# Los datos muestran que los outliers en Q_Tobin y ROA corresponden a empresas
+# reales con modelos de negocio estructuralmente distintos (tech de activos
+# intangibles, finanzas, lujo). NO son errores de datos ni evidencia de
+# impacto ESG extraordinario — de hecho tienen ESG ~15 puntos MENOR que el
+# promedio global. Por tanto:
+#
+# PROTOCOLO ADOPTADO:
+#   1. Modelo PRINCIPAL: datos RAW (sin winsorizar Q_Tobin ni ROA)
+#   2. Modelo SENSIBILIDAD: datos winsorizados P1-P99 en todas las variables
+#   3. Comparación de coeficientes β_ESG entre ambas especificaciones
+#   4. Diagnóstico: Cook, leverage, DFBETAS en Scripts 3.2 y 3.3
+#
+# LIMPIEZA SELECTIVA (sí aplicada en AMBAS versiones):
+#   - Price_To_Book: mín detectado = -4365. No es evidencia económica real,
+#     corresponde a patrimonio neto negativo extremo → winsorizar P1-P99
+#   - Growth: mediana=3% pero desv.est.=1000%. Caída brutal que indica
+#     fusiones, spin-offs, recapitalizaciones → eventos que rompen paneles
+#     → winsorizar P1-P99
+#
+# REFERENCIAS METODOLÓGICAS:
+#   - Cook (1977): distancia de Cook para detectar observaciones influyentes
+#   - Belsley, Kuh & Welsch (1980): leverage y DFBETAS
+#   - Verbeek (2004): panel data, diagnóstico de especificación
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT 2.3: PREPARACIÓN DE DATOS — PROTOCOLO DE ROBUSTEZ")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+if 'df_main' not in locals():
+    print("❌ Error: ejecuta primero los Bloques 1-5 de construcción de df_main")
+    exit()
+
+YEARS = range(2015, 2026)
+
+# ==============================================================================
+# SECCIÓN 1: LIMPIEZA SELECTIVA — Solo donde está justificado
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 1: LIMPIEZA SELECTIVA (Price_To_Book y Growth)")
+print("─" * 80)
+
+print("""
+Se aplica limpieza SOLO a dos variables donde los extremos no representan
+fenómenos económicos válidos para esta investigación:
+
+  Price_To_Book < 0:  patrimonio neto negativo → puede ser técnico/transitorio
+                      pero distorsiona quintiles de valor en HML
+  Price_To_Book extremo: mín = -4365, P1 = 0.32 → el rango inferior es ruido
+
+  Growth > P99:       fusiones y adquisiciones → cambio de estructura, no
+                      crecimiento orgánico; se controla con winsorización
+  Growth < P1:        spin-offs, desinversiones masivas → mismo argumento
+
+Q_Tobin y ROA NO se tocan aquí. Son reales y serán testeados en sensibilidad.
+""")
+
+df_clean = df_main.copy()
+
+# ── Price_To_Book ─────────────────────────────────────────────────────────────
+ptb_p1  = df_clean['Price_To_Book'].quantile(0.01)
+ptb_p99 = df_clean['Price_To_Book'].quantile(0.99)
+
+casos_ptb = ((df_clean['Price_To_Book'] < ptb_p1) |
+             (df_clean['Price_To_Book'] > ptb_p99)).sum()
+
+df_clean['Price_To_Book'] = df_clean['Price_To_Book'].clip(ptb_p1, ptb_p99)
+
+print(f"Price_To_Book:")
+print(f"  Rango original: [{df_main['Price_To_Book'].min():.4f}, {df_main['Price_To_Book'].max():.4f}]")
+print(f"  Rango limpio:   [{ptb_p1:.4f}, {ptb_p99:.4f}]")
+print(f"  Filas afectadas: {casos_ptb:,}")
+
+# ==============================================================================
+# SECCIÓN 2: df_monthly_raw Y df_monthly_w
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 2: CONSTRUCCIÓN DE df_monthly")
+print("─" * 80)
+
+print("""
+VERSIÓN RAW (modelo principal):
+  Variables como están en df_clean — Q_Tobin y ROA sin recortar.
+  Es el modelo que se presenta en los resultados principales de H1.
+
+VERSIÓN WINSORIZADA (sensibilidad):
+  Todas las variables numéricas recortadas a P1-P99.
+  Se usa para verificar que los hallazgos de H1 no dependen de extremos.
+
+REGLA DE INTERPRETACIÓN (se aplicará en Scripts 3.2 y 3.3):
+  Si |β_ESG_raw - β_ESG_wins| / |β_ESG_raw| < 0.10 → hallazgo robusto
+  Si la diferencia > 0.30 → los extremos importan y hay que reportarlo
+  Si el signo cambia → hallazgo frágil, requiere análisis adicional
+""")
+
+df_monthly = df_clean.copy()
+df_monthly['Date'] = pd.to_datetime(df_monthly['Date'])
+df_monthly['YearMonth'] = df_monthly['Date'].dt.to_period('M')
+
+# ── Retorno mensual por empresa ────────────────────────────────────────────────
+retorno_mensual = (
+    df_monthly
+    .groupby(['RIC', 'YearMonth'])['Return_1D']
+    .apply(lambda x: (1 + x.dropna()).prod() - 1 if x.notna().any() else np.nan)
+    .reset_index()
+    .rename(columns={'Return_1D': 'Return_monthly'})
+)
+
+# ── Rf mensual ────────────────────────────────────────────────────────────────
+rf_mensual = (
+    df_monthly
+    .groupby('YearMonth')['Euribor_1M']
+    .mean()
+    .reset_index()
+    .rename(columns={'Euribor_1M': 'Rf_monthly'})
+)
+
+# ── ESG rezagado (t-1): REGLA OBLIGATORIA anti look-ahead bias ────────────────
+# Se toma el ESG_Score del mes anterior, no del mes actual.
+# Si se usara el score del mismo mes, el modelo "sabría" información
+# que el mercado todavía no tiene al tomar la decisión de inversión.
+esg_data = (
+    df_monthly[['RIC', 'YearMonth', 'ESG_Score', 'E_Score', 'S_Score', 'G_Score']]
+    .drop_duplicates(subset=['RIC', 'YearMonth'])
+    .sort_values(['RIC', 'YearMonth'])
+    .reset_index(drop=True)
+)
+
+for col in ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']:
+    esg_data[f'{col}_lag1'] = esg_data.groupby('RIC')[col].shift(1)
+
+esg_rezagado = esg_data[
+    ['RIC', 'YearMonth', 'ESG_Score_lag1', 'E_Score_lag1', 'S_Score_lag1', 'G_Score_lag1']
+].copy()
+
+# ── Controles: último valor del mes por empresa ────────────────────────────────
+controles = (
+    df_monthly
+    .groupby(['RIC', 'YearMonth'])[
+        ['Market_Cap_EUR', 'Total_Assets_EUR', 'Q_Tobin',
+         'Size', 'Leverage', 'ROA_Final', 'Price_To_Book', 'primer_año_esg']
+    ]
+    .last()
+    .reset_index()
+)
+
+# ── Combinar en df_monthly_raw ─────────────────────────────────────────────────
+df_monthly_raw = (
+    retorno_mensual
+    .merge(rf_mensual,    on='YearMonth',         how='left')
+    .merge(esg_rezagado,  on=['RIC', 'YearMonth'], how='left')
+    .merge(controles,     on=['RIC', 'YearMonth'], how='left')
+)
+df_monthly_raw['Date'] = df_monthly_raw['YearMonth'].dt.to_timestamp()
+df_monthly_raw['Excess_Return_monthly'] = df_monthly_raw['Return_monthly'] - df_monthly_raw['Rf_monthly']
+
+# ── df_monthly_w: winsorización completa ──────────────────────────────────────
+df_monthly_w = df_monthly_raw.copy()
+
+vars_wins_monthly = ['Q_Tobin', 'Size', 'Leverage', 'ROA_Final']
+for var in vars_wins_monthly:
+    if var in df_monthly_w.columns:
+        p1  = df_monthly_w[var].quantile(0.01)
+        p99 = df_monthly_w[var].quantile(0.99)
+        df_monthly_w[var] = df_monthly_w[var].clip(p1, p99)
+
+print(f"✅ df_monthly_raw (modelo principal H1):")
+print(f"   {df_monthly_raw.shape[0]:,} filas × {df_monthly_raw.shape[1]} columnas")
+print(f"   Período: {df_monthly_raw['Date'].min().date()} → {df_monthly_raw['Date'].max().date()}")
+print(f"   Empresas: {df_monthly_raw['RIC'].nunique()}")
+
+print(f"\n   Cobertura:")
+for col in ['Return_monthly', 'Excess_Return_monthly', 'Rf_monthly',
+            'ESG_Score_lag1', 'E_Score_lag1', 'S_Score_lag1', 'G_Score_lag1',
+            'Size', 'Leverage', 'ROA_Final', 'Q_Tobin']:
+    if col in df_monthly_raw.columns:
+        cob = df_monthly_raw[col].notna().sum() / len(df_monthly_raw) * 100
+        print(f"     {col:<30} {cob:>6.1f}%")
+
+print(f"\n✅ df_monthly_w (sensibilidad H1): mismas dimensiones, Q_Tobin y ROA winsorizados")
+
+# ==============================================================================
+# SECCIÓN 3: df_annual_raw Y df_annual_w
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 3: CONSTRUCCIÓN DE df_annual")
+print("─" * 80)
+
+print("""
+Para H2 (panel Q de Tobin) se necesita UNA observación por empresa por año.
+Growth se calcula aquí y se winsoriza en AMBAS versiones porque:
+  - Desv.est. = 1000% vs mediana = 3%
+  - Los eventos extremos (M&A, spin-offs) rompen la regresión de panel
+  - NO es información sobre ESG → es ruido estructural legítimo de eliminar
+""")
+
+df_anual_prep = df_clean.copy()
+df_anual_prep['Year'] = df_anual_prep['Date'].dt.year
+
+# Agregaciones anuales
+df_annual_raw = (
+    df_anual_prep
+    .groupby(['RIC', 'Year'])
+    .agg(
+        Q_Tobin          = ('Q_Tobin',          'last'),
+        Size             = ('Size',              'mean'),
+        Leverage         = ('Leverage',          'mean'),
+        ROA_Final        = ('ROA_Final',         'mean'),
+        ESG_Score        = ('ESG_Score',         'mean'),
+        E_Score          = ('E_Score',           'mean'),
+        S_Score          = ('S_Score',           'mean'),
+        G_Score          = ('G_Score',           'mean'),
+        Total_Assets_EUR = ('Total_Assets_EUR',  'last'),
+        primer_año_esg   = ('primer_año_esg',    'max'),
+    )
+    .reset_index()
+)
+
+# Calcular Growth anual
+df_annual_raw = df_annual_raw.sort_values(['RIC', 'Year']).reset_index(drop=True)
+df_annual_raw['Assets_lag1'] = df_annual_raw.groupby('RIC')['Total_Assets_EUR'].shift(1)
+df_annual_raw['Growth'] = (
+    (df_annual_raw['Total_Assets_EUR'] - df_annual_raw['Assets_lag1']) /
+    df_annual_raw['Assets_lag1']
+)
+df_annual_raw.drop(columns=['Assets_lag1'], inplace=True)
+
+# ESG rezagado anual (t-1)
+for col in ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']:
+    df_annual_raw[f'{col}_lag1'] = df_annual_raw.groupby('RIC')[col].shift(1)
+
+# Winsorizar Growth en RAW (justificado: rompe panel)
+growth_p1  = df_annual_raw['Growth'].quantile(0.01)
+growth_p99 = df_annual_raw['Growth'].quantile(0.99)
+growth_extremos = ((df_annual_raw['Growth'] < growth_p1) |
+                   (df_annual_raw['Growth'] > growth_p99)).sum()
+
+df_annual_raw['Growth'] = df_annual_raw['Growth'].clip(growth_p1, growth_p99)
+
+print(f"Growth winsorizado en ambas versiones:")
+print(f"  P1 = {growth_p1:.4f} ({growth_p1*100:.2f}%)")
+print(f"  P99 = {growth_p99:.4f} ({growth_p99*100:.2f}%)")
+print(f"  Observaciones afectadas: {growth_extremos:,}")
+
+# df_annual_w: winsorización adicional de Q_Tobin, Leverage, ROA
+df_annual_w = df_annual_raw.copy()
+vars_wins_annual = ['Q_Tobin', 'Leverage', 'ROA_Final']
+for var in vars_wins_annual:
+    if var in df_annual_w.columns:
+        p1  = df_annual_w[var].quantile(0.01)
+        p99 = df_annual_w[var].quantile(0.99)
+        df_annual_w[var] = df_annual_w[var].clip(p1, p99)
+
+print(f"\n✅ df_annual_raw (modelo principal H2):")
+print(f"   {df_annual_raw.shape[0]:,} filas × {df_annual_raw.shape[1]} columnas")
+print(f"   Período: {df_annual_raw['Year'].min()} → {df_annual_raw['Year'].max()}")
+print(f"   Empresas: {df_annual_raw['RIC'].nunique()}")
+
+print(f"\n   Cobertura:")
+for col in ['Q_Tobin', 'Size', 'Leverage', 'ROA_Final', 'Growth',
+            'ESG_Score_lag1', 'E_Score_lag1', 'S_Score_lag1', 'G_Score_lag1']:
+    if col in df_annual_raw.columns:
+        cob = df_annual_raw[col].notna().sum() / len(df_annual_raw) * 100
+        print(f"     {col:<30} {cob:>6.1f}%")
+
+print(f"\n✅ df_annual_w (sensibilidad H2): mismas dimensiones, Q_Tobin y ROA winsorizados")
+
+# ==============================================================================
+# SECCIÓN 4: FUNCIONES DE DIAGNÓSTICO (para usar en Scripts 3.2 y 3.3)
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 4: FUNCIONES DE DIAGNÓSTICO")
+print("─" * 80)
+
+print("""
+Las siguientes funciones se usarán en Scripts 3.2 (H1) y 3.3 (H2) para:
+  1. Calcular distancia de Cook: identifica observaciones que cambian
+     significativamente los coeficientes si se eliminan
+  2. Calcular leverage (hat values): identifica puntos de influencia extrema
+  3. Calcular DFBETAS: cuánto cambia β_ESG si se elimina cada observación
+  4. Comparar coeficientes raw vs winsorizado
+""")
+
+from sklearn.linear_model import LinearRegression
+
+def calcular_cook_distance(y, X):
+    """
+    Calcula la distancia de Cook para cada observación.
+    Umbral estándar: Cook > 4/n indica observación influyente.
+    """
+    n, k = X.shape
+    modelo = LinearRegression().fit(X, y)
+    y_pred = modelo.predict(X)
+    residuos = y - y_pred
+    mse = np.sum(residuos**2) / (n - k - 1)
+
+    H = X @ np.linalg.pinv(X.T @ X) @ X.T  # Matriz hat
+    leverage = np.diag(H)
+
+    cook = (residuos**2 * leverage) / (k * mse * (1 - leverage)**2)
+    return cook, leverage
+
+
+def comparar_coeficientes(beta_raw, beta_wins, nombre_var='β_ESG'):
+    """
+    Compara coeficientes entre versión raw y winsorizada.
+    Devuelve % de variación y veredicto de robustez.
+    """
+    if beta_raw == 0:
+        return None, "No calculable (beta raw = 0)"
+
+    variacion = abs(beta_raw - beta_wins) / abs(beta_raw) * 100
+
+    if variacion < 10:
+        veredicto = "✅ ROBUSTO (variación < 10%)"
+    elif variacion < 30:
+        veredicto = "⚠️  MODERADO (variación 10-30%)"
+    else:
+        veredicto = "🔴 FRÁGIL (variación > 30%)"
+
+    print(f"\n  Comparación {nombre_var}:")
+    print(f"    β raw:        {beta_raw:.6f}")
+    print(f"    β winsorizado:{beta_wins:.6f}")
+    print(f"    Variación:    {variacion:.1f}%")
+    print(f"    Veredicto:    {veredicto}")
+
+    return variacion, veredicto
+
+
+def resumen_influyentes(cook_distances, leverage, ric_index, umbral_cook=None):
+    """
+    Identifica y reporta observaciones influyentes.
+    """
+    n = len(cook_distances)
+    if umbral_cook is None:
+        umbral_cook = 4 / n
+
+    influyentes_cook = np.where(cook_distances > umbral_cook)[0]
+    influyentes_lev  = np.where(leverage > 2 * np.mean(leverage))[0]
+    ambos = np.intersect1d(influyentes_cook, influyentes_lev)
+
+    print(f"\n  Observaciones influyentes:")
+    print(f"    Por Cook (> 4/n = {umbral_cook:.4f}): {len(influyentes_cook)}")
+    print(f"    Por leverage (> 2×media):             {len(influyentes_lev)}")
+    print(f"    Influyentes en AMBOS criterios:        {len(ambos)}")
+
+    if len(ambos) > 0 and ric_index is not None:
+        print(f"    Top casos (ambos criterios):")
+        for idx in ambos[:5]:
+            print(f"      {ric_index[idx]} — Cook: {cook_distances[idx]:.4f}")
+
+    return influyentes_cook, influyentes_lev, ambos
+
+print("  ✅ Función calcular_cook_distance() → disponible")
+print("  ✅ Función comparar_coeficientes()   → disponible")
+print("  ✅ Función resumen_influyentes()      → disponible")
+print("\n  Uso en Scripts 3.2/3.3:")
+print("    cook, lev = calcular_cook_distance(y, X)")
+print("    comparar_coeficientes(beta_raw, beta_wins, 'β_ESG_Score')")
+print("    resumen_influyentes(cook, lev, df['RIC'].values)")
+
+# ==============================================================================
+# SECCIÓN 5: RESUMEN FINAL
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("RESUMEN FINAL — DATASETS DISPONIBLES")
+print("=" * 80)
+
+print(f"""
+─────────────────────────────────────────────────────────────────────
+PARA H1 (MODELO CARHART 4 FACTORES):
+─────────────────────────────────────────────────────────────────────
+
+  df_monthly_raw  → MODELO PRINCIPAL
+    {df_monthly_raw.shape[0]:,} filas × {df_monthly_raw.shape[1]} columnas
+    Q_Tobin y ROA sin winsorizar
+    ESG en rezago t-1 (anti look-ahead bias)
+    Scores disponibles: ESG_Score, E_Score, S_Score, G_Score (todos lag1)
+
+  df_monthly_w    → ANÁLISIS DE SENSIBILIDAD
+    Mismas dimensiones
+    Q_Tobin, Size, Leverage, ROA winsorizados a P1-P99
+
+─────────────────────────────────────────────────────────────────────
+PARA H2 (PANEL Q DE TOBIN):
+─────────────────────────────────────────────────────────────────────
+
+  df_annual_raw   → MODELO PRINCIPAL
+    {df_annual_raw.shape[0]:,} filas × {df_annual_raw.shape[1]} columnas
+    Growth winsorizado (justificado: M&A rompe panel)
+    Q_Tobin y ROA sin winsorizar
+    primer_año_esg como variable de control
+
+  df_annual_w     → ANÁLISIS DE SENSIBILIDAD
+    Mismas dimensiones
+    Q_Tobin, Leverage, ROA también winsorizados
+
+─────────────────────────────────────────────────────────────────────
+FUNCIONES DE DIAGNÓSTICO (disponibles en memoria):
+─────────────────────────────────────────────────────────────────────
+  calcular_cook_distance()   → distancia de Cook + leverage
+  comparar_coeficientes()    → robustez raw vs winsorizado
+  resumen_influyentes()      → identificar casos problemáticos
+
+─────────────────────────────────────────────────────────────────────
+PRÓXIMO PASO:
+─────────────────────────────────────────────────────────────────────
+  Script 3.1: Construir factores SMB, HML, WML desde df_monthly_raw
+  Script 3.2: Regresiones H1 — alpha de Jensen
+              → correr raw, correr wins, comparar_coeficientes()
+  Script 3.3: Regresiones H2 — panel Q de Tobin
+              → correr raw, correr wins, Cook distance, comparar
+""")
+
+print(f"Fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)

@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Infografía TFM - Impacto ESG en Alpha y Beta</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 1200px;
+            width: 100%;
+            padding: 60px;
+            position: relative;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 50px;
+        }
+
+        .header h1 {
+            font-size: 42px;
+            color: #667eea;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        .header p {
+            font-size: 16px;
+            color: #666;
+            font-weight: 500;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: #999;
+            margin-top: 5px;
+        }
+
+        .content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 40px;
+            margin-bottom: 40px;
+        }
+
+        .discovery {
+            background: linear-gradient(135deg, #f5f7fa 0%, #f9fafb 100%);
+            padding: 30px;
+            border-radius: 12px;
+            border-left: 5px solid;
+            position: relative;
+        }
+
+        .discovery.h1 {
+            border-left-color: #e74c3c;
+        }
+
+        .discovery.h2 {
+            border-left-color: #3498db;
+        }
+
+        .discovery.h3 {
+            border-left-color: #2ecc71;
+        }
+
+        .discovery h2 {
+            font-size: 22px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+        }
+
+        .discovery h2::before {
+            content: '';
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            margin-right: 12px;
+            border-radius: 50%;
+            font-weight: bold;
+            line-height: 24px;
+            text-align: center;
+            color: white;
+            font-size: 14px;
+        }
+
+        .h1 h2::before {
+            background: #e74c3c;
+            content: '✕';
+        }
+
+        .h2 h2::before {
+            background: #3498db;
+            content: '−';
+        }
+
+        .h3 h2::before {
+            background: #2ecc71;
+            content: '◆';
+        }
+
+        .finding {
+            margin-bottom: 15px;
+            font-size: 15px;
+            line-height: 1.6;
+            color: #333;
+        }
+
+        .metric {
+            background: white;
+            padding: 12px 15px;
+            border-radius: 8px;
+            margin-top: 10px;
+            border-left: 3px solid #667eea;
+        }
+
+        .metric-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #667eea;
+        }
+
+        .metric-label {
+            font-size: 13px;
+            color: #666;
+            margin-top: 4px;
+        }
+
+        .context {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            border-radius: 12px;
+            margin-bottom: 40px;
+            grid-column: 1 / -1;
+        }
+
+        .context h3 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+
+        .context-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+        }
+
+        .context-item {
+            text-align: center;
+        }
+
+        .context-value {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .context-label {
+            font-size: 13px;
+            opacity: 0.9;
+        }
+
+        .footer {
+            text-align: center;
+            padding-top: 30px;
+            border-top: 2px solid #eee;
+            color: #666;
+            font-size: 14px;
+        }
+
+        .key-insight {
+            background: #fff3cd;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #ffc107;
+            margin-top: 20px;
+            grid-column: 1 / -1;
+        }
+
+        .key-insight h3 {
+            color: #ff6b6b;
+            margin-bottom: 10px;
+            font-size: 18px;
+        }
+
+        .key-insight p {
+            color: #333;
+            font-size: 15px;
+            line-height: 1.6;
+        }
+
+        @media (max-width: 1024px) {
+            .content {
+                grid-template-columns: 1fr;
+            }
+
+            .context-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 30px;
+            }
+
+            .header h1 {
+                font-size: 28px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌱 Impacto del Desempeño ESG en Alpha y Beta</h1>
+            <p>Análisis del STOXX 600 (2015-2025)</p>
+            <p class="subtitle">Descubrimientos clave de un Trabajo Final de Máster en Data Science</p>
+        </div>
+
+        <div class="context">
+            <h3>📊 Base de Datos</h3>
+            <div class="context-grid">
+                <div class="context-item">
+                    <div class="context-value">598</div>
+                    <div class="context-label">Empresas STOXX 600</div>
+                </div>
+                <div class="context-item">
+                    <div class="context-value">1.58M</div>
+                    <div class="context-label">Observaciones diarias</div>
+                </div>
+                <div class="context-item">
+                    <div class="context-value">11 años</div>
+                    <div class="context-label">2015 a 2025</div>
+                </div>
+                <div class="context-item">
+                    <div class="context-value">94.6%</div>
+                    <div class="context-label">Cobertura ESG</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="content">
+            <div class="discovery h1">
+                <h2>Green Premium Paradox</h2>
+                <div class="finding">
+                    <strong>Las empresas con PEOR ESG generan mayor rentabilidad anormal.</strong>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">-6.95%</div>
+                    <div class="metric-label">Retorno anormal negativo (Long ESG Alto - Short ESG Bajo)</div>
+                </div>
+                <div class="finding" style="margin-top: 12px;">
+                    Usando modelo Carhart 4 factores, las empresas de mejor ESG tienen <strong>-0.60% de alpha mensual</strong> en comparación con las de peor ESG. Patrón monotónico consistente en todos los pilares (E, S, G).
+                </div>
+            </div>
+
+            <div class="discovery h2">
+                <h2>Efecto Modesto en Valoración</h2>
+                <div class="finding">
+                    <strong>ESG no impacta significativamente el Tobin Q (valor empresarial).</strong>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">No significativo</div>
+                    <div class="metric-label">Efecto en modelo principal (p > 0.19)</div>
+                </div>
+                <div class="finding" style="margin-top: 12px;">
+                    Análisis de panel dinámico con 589 empresas (2016-2025). El pilar G muestra efecto negativo robusto en especificaciones within-año, consistente con H1.
+                </div>
+            </div>
+
+            <div class="discovery h3">
+                <h2>Protección en Estrés de Mercado</h2>
+                <div class="finding">
+                    <strong>ESG alto evita amplificación de riesgo en crisis.</strong>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">+0.21 (δβ)</div>
+                    <div class="metric-label">Amplificación de beta en Q5 bajo estrés (p=0.002)</div>
+                </div>
+                <div class="finding" style="margin-top: 12px;">
+                    Markov-Switching revela que empresas con peor ESG aumentan su riesgo sistemático en periodos de crisis, mientras que las de ESG alto mantienen estabilidad. Protección relativa del ESG.
+                </div>
+            </div>
+        </div>
+
+        <div class="key-insight">
+            <h3>💡 Síntesis: Tres Piezas Convergentes</h3>
+            <p>
+                <strong>H1:</strong> Alpha negativo para el Long-ESG (Green Premium). <strong>H2:</strong> Efecto negativo de G dentro del mismo año. <strong>H3:</strong> Q5 (peor ESG) amplifica beta en crisis. Juntas, revelan que el mercado penaliza ESG alto a corto plazo, pero empresas de bajo ESG cargan con riesgo "brown" que se materializa en estrés sistémico. Coherente con transición energética y riesgo de transición (Bolton & Kacperczyk 2021).
+            </p>
+        </div>
+
+        <div class="footer">
+            <p><strong>Metodología:</strong> Modelo Carhart, Panel FE con Driscoll-Kraay, Markov-Switching CAPM</p>
+            <p>📧 Estudio de caso sobre dinámicas ESG en mercados europeos desarrollados</p>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,749 @@
+# ==============================================================================
+# SCRIPT 3.3: HIPÓTESIS 2 — PREFERENCIAS DEL MERCADO Y VALORACIÓN (Q DE TOBIN)
+# ==============================================================================
+#
+# PREGUNTA: ¿El mercado europeo valora de forma diferente los tres pilares
+# E, S, G? ¿Cuál genera mayor valor corporativo a largo plazo?
+#
+# MODELO (panel con efectos fijos por empresa):
+#   TobinQ_it = β0 + β1·ESG_it-1 + β2·Size_it + β3·Lev_it + β4·ROA_it
+#               + β5·Growth_it + μ_i + ε_it
+#
+#   donde:
+#     TobinQ_it = Market_Cap / Total_Assets (último día del año)
+#     ESG_it-1  = score rezagado un año (anti look-ahead bias)
+#     μ_i       = efecto fijo por empresa (heterogeneidad no observable)
+#
+# METODOLOGÍA (protocolo HITO 3):
+#   1. Test de Hausman → decide FE vs RE
+#   2. Diagnósticos del panel → justifican errores Driscoll-Kraay
+#   3. Estimación FE + Driscoll-Kraay (dependencia transversal + autocorrelación)
+#   4. 4 regresiones separadas: ESG_Score, E_Score, S_Score, G_Score
+#
+# CRITERIO DE DECISIÓN (guía HITO 3):
+#   Zona Verde:  β1 > 0 significativo en pilar G o S → el mercado premia la
+#                mitigación de controversias socio-gubernamentales (Sandretto 2025)
+#   Zona Roja:   β1 < 0 en pilar E → el costo de la transición ambiental
+#                penaliza la valuación a corto/medio plazo (Oluwakemi & Mishelle 2025)
+#
+# NOTA primer_año_esg: es constante por empresa → queda absorbida por los
+# efectos fijos μ_i. No se incluye como regresor (sería colineal); el control
+# de adopción temprana/tardía de ESG está implícito en el FE.
+#
+# REQUIERE: df_annual_raw y df_annual_w (Script 2.3) en memoria
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from scipy import stats
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# linearmodels: estimador de panel con soporte Driscoll-Kraay (cov_type='kernel')
+try:
+    from linearmodels.panel import PanelOLS, RandomEffects
+except ImportError:
+    import subprocess, sys
+    print("  Instalando linearmodels...")
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'linearmodels'])
+    from linearmodels.panel import PanelOLS, RandomEffects
+
+print("=" * 80)
+print("SCRIPT 3.3: HIPÓTESIS 2 — PANEL Q DE TOBIN (FE + DRISCOLL-KRAAY)")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, nombre in [('df_annual_raw', 'Script 2.3'),
+                    ('df_annual_w',   'Script 2.3')]:
+    if var not in dir():
+        print(f"❌ '{var}' no está en memoria. Ejecuta {nombre} primero.")
+        raise SystemExit
+
+SCORES = ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']
+SCORE_LABELS = {'ESG_Score': 'ESG Compuesto', 'E_Score': 'Pilar E',
+                'S_Score': 'Pilar S', 'G_Score': 'Pilar G'}
+CONTROLES = ['Size', 'Leverage', 'ROA_Final', 'Growth']
+VAR_DEP = 'Q_Tobin'
+
+
+def sig_stars(p):
+    if   p < 0.01: return '***'
+    elif p < 0.05: return '**'
+    elif p < 0.10: return '*'
+    else:          return ''
+
+# ==============================================================================
+# SECCIÓN 1: PREPARACIÓN DEL PANEL Y ESTADÍSTICA DESCRIPTIVA
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 1: Preparación del panel y estadística descriptiva")
+print("─" * 80)
+
+
+def preparar_panel(df_annual):
+    """Indexa el panel (RIC, Year) para linearmodels."""
+    panel = df_annual.copy()
+    panel['Year'] = panel['Year'].astype(int)
+    return panel.set_index(['RIC', 'Year'])
+
+
+panel_raw = preparar_panel(df_annual_raw)
+panel_w   = preparar_panel(df_annual_w)
+
+print(f"\n  Panel RAW: {len(panel_raw):,} obs | "
+      f"{panel_raw.index.get_level_values('RIC').nunique()} empresas | "
+      f"{panel_raw.index.get_level_values('Year').nunique()} años "
+      f"({panel_raw.index.get_level_values('Year').min()}-{panel_raw.index.get_level_values('Year').max()})")
+
+# Muestra efectiva por score (dropna del modelo completo)
+print(f"\n  Muestra efectiva por regresión (tras dropna):")
+for score in SCORES:
+    cols_modelo = [VAR_DEP, f'{score}_lag1'] + CONTROLES
+    n_eff = panel_raw[cols_modelo].dropna().shape[0]
+    print(f"    {SCORE_LABELS[score]:<15}: {n_eff:,} obs empresa-año")
+
+# Estadística descriptiva de las variables del modelo
+print(f"\n  TABLA 1A — Estadística descriptiva (panel RAW):")
+print(f"  {'Variable':<18} {'n':>6} {'Media':>9} {'Desv':>9} {'P25':>8} {'Mediana':>8} {'P75':>8} {'Mín':>9} {'Máx':>9}")
+print(f"  {'─'*92}")
+for col in [VAR_DEP, 'ESG_Score_lag1', 'E_Score_lag1', 'S_Score_lag1', 'G_Score_lag1'] + CONTROLES:
+    s = panel_raw[col].dropna()
+    print(f"  {col:<18} {len(s):>6,} {s.mean():>9.3f} {s.std():>9.3f} {s.quantile(0.25):>8.3f} "
+          f"{s.median():>8.3f} {s.quantile(0.75):>8.3f} {s.min():>9.3f} {s.max():>9.3f}")
+
+# Matriz de correlaciones de las variables del modelo (chequeo multicolinealidad)
+print(f"\n  TABLA 1B — Correlaciones entre regresores (panel RAW):")
+vars_corr = ['ESG_Score_lag1'] + CONTROLES
+corr_panel = panel_raw[vars_corr].dropna().corr()
+print("  " + corr_panel.round(3).to_string().replace('\n', '\n  '))
+
+alta_corr = False
+for i in range(len(vars_corr)):
+    for j in range(i+1, len(vars_corr)):
+        c = corr_panel.iloc[i, j]
+        if abs(c) > 0.5:
+            print(f"\n  ⚠️  Correlación alta: {vars_corr[i]} ↔ {vars_corr[j]} = {c:.3f}")
+            alta_corr = True
+if not alta_corr:
+    print(f"\n  ✅ Sin correlaciones > |0.50| entre regresores → multicolinealidad controlada")
+
+# ==============================================================================
+# SECCIÓN 2: TEST DE HAUSMAN — EFECTOS FIJOS vs ALEATORIOS
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 2: Test de Hausman — ¿Efectos Fijos o Aleatorios?")
+print("─" * 80)
+
+print("""
+Test de Hausman (1978):
+  H0: la diferencia entre estimadores FE y RE no es sistemática → RE es
+      consistente y eficiente (preferir RE)
+  H1: los efectos individuales están correlacionados con los regresores
+      → solo FE es consistente (preferir FE)
+  Estadístico: H = (b_FE − b_RE)' [V_FE − V_RE]⁻¹ (b_FE − b_RE) ~ χ²(k)
+""")
+
+
+def ajustar_fe(panel, score, cov='unadjusted'):
+    """Estima el modelo FE para un score. cov: 'unadjusted' o 'kernel' (Driscoll-Kraay)."""
+    cols = [VAR_DEP, f'{score}_lag1'] + CONTROLES
+    datos = panel[cols].dropna()
+    y = datos[VAR_DEP]
+    X = datos[[f'{score}_lag1'] + CONTROLES]
+    mod = PanelOLS(y, X, entity_effects=True, drop_absorbed=True)
+    if cov == 'kernel':
+        return mod.fit(cov_type='kernel', kernel='bartlett'), datos
+    return mod.fit(), datos
+
+
+def ajustar_re(panel, score):
+    """Estima el modelo RE (con constante) para un score."""
+    cols = [VAR_DEP, f'{score}_lag1'] + CONTROLES
+    datos = panel[cols].dropna()
+    y = datos[VAR_DEP]
+    X = sm.add_constant(datos[[f'{score}_lag1'] + CONTROLES])
+    return RandomEffects(y, X).fit(), datos
+
+
+def test_hausman(fe_res, re_res):
+    """Test de Hausman clásico sobre los coeficientes comunes (sin constante)."""
+    comunes = [c for c in fe_res.params.index if c in re_res.params.index and c != 'const']
+    b_fe = fe_res.params[comunes].values
+    b_re = re_res.params[comunes].values
+    v_fe = fe_res.cov.loc[comunes, comunes].values
+    v_re = re_res.cov.loc[comunes, comunes].values
+    diff = b_fe - b_re
+    V = v_fe - v_re
+    stat = float(diff @ np.linalg.pinv(V) @ diff)
+    gl = len(comunes)
+    p_val = 1 - stats.chi2.cdf(stat, gl)
+    return stat, gl, p_val
+
+
+print(f"  {'Score':<15} {'χ²':>10} {'gl':>4} {'p-value':>10}   Decisión")
+print(f"  {'─'*65}")
+
+hausman_resultados = {}
+for score in SCORES:
+    fe_res, _ = ajustar_fe(panel_raw, score)
+    re_res, _ = ajustar_re(panel_raw, score)
+    h_stat, gl, p_h = test_hausman(fe_res, re_res)
+    hausman_resultados[score] = {'chi2': h_stat, 'gl': gl, 'p': p_h}
+    dec = "Rechazar H0 → usar FE ✅" if p_h < 0.05 else "No rechazar H0 → RE admisible"
+    print(f"  {SCORE_LABELS[score]:<15} {h_stat:>10.3f} {gl:>4} {p_h:>10.4f}   {dec}")
+
+print("""
+  Nota: cuando V_FE − V_RE no es definida positiva se usa la pseudo-inversa
+  (Moore-Penrose), práctica estándar. La heterogeneidad no observable por
+  empresa (sector, país, gobernanza histórica) hace esperar el rechazo de H0.
+""")
+
+# ==============================================================================
+# SECCIÓN 3: DIAGNÓSTICOS DEL PANEL — JUSTIFICACIÓN DE DRISCOLL-KRAAY
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 3: Diagnósticos del panel (sobre residuos FE del modelo ESG)")
+print("─" * 80)
+
+print("""
+Tres diagnósticos que motivan el uso de errores estándar Driscoll-Kraay:
+  1. Autocorrelación serial AR(1) en los residuos (dimensión temporal)
+  2. Heterocedasticidad — Breusch-Pagan (varianza no constante)
+  3. Dependencia transversal — Pesaran CD (shocks comunes entre empresas)
+""")
+
+fe_esg, datos_esg = ajustar_fe(panel_raw, 'ESG_Score')
+resid_esg = fe_esg.resids.copy()
+resid_df = resid_esg.reset_index()
+resid_df.columns = ['RIC', 'Year', 'resid']
+
+# ── 3.1 Autocorrelación AR(1): e_it sobre e_i,t-1 (pooled con cluster empresa) ─
+resid_df = resid_df.sort_values(['RIC', 'Year'])
+resid_df['resid_lag'] = resid_df.groupby('RIC')['resid'].shift(1)
+ar_data = resid_df.dropna(subset=['resid', 'resid_lag'])
+
+X_ar = sm.add_constant(ar_data['resid_lag'])
+mod_ar = sm.OLS(ar_data['resid'], X_ar).fit(
+    cov_type='cluster', cov_kwds={'groups': ar_data['RIC']})
+rho = mod_ar.params['resid_lag']
+t_rho = mod_ar.tvalues['resid_lag']
+p_rho = mod_ar.pvalues['resid_lag']
+
+print(f"  1. AUTOCORRELACIÓN AR(1) (residuos FE, errores cluster por empresa):")
+print(f"     ρ = {rho:.4f} | t = {t_rho:.3f} | p = {p_rho:.4f}")
+print(f"     {'⚠️  Autocorrelación significativa → Driscoll-Kraay necesario' if p_rho < 0.05 else '✅ Sin autocorrelación significativa'}")
+
+# ── 3.2 Heterocedasticidad: Breusch-Pagan sobre residuos² vs regresores ───────
+from statsmodels.stats.diagnostic import het_breuschpagan
+X_bp = sm.add_constant(datos_esg[['ESG_Score_lag1'] + CONTROLES])
+bp_stat, bp_p, _, _ = het_breuschpagan(resid_esg.values, X_bp.values)
+
+print(f"\n  2. HETEROCEDASTICIDAD (Breusch-Pagan):")
+print(f"     LM = {bp_stat:.2f} | p = {bp_p:.2e}")
+print(f"     {'⚠️  Heterocedasticidad presente → errores robustos necesarios' if bp_p < 0.05 else '✅ Homocedasticidad no rechazada'}")
+
+# ── 3.3 Dependencia transversal: test CD de Pesaran (2004) ────────────────────
+res_piv = resid_df.pivot(index='Year', columns='RIC', values='resid')
+M = res_piv.notna().astype(float).values            # T × N indicador
+Tij = M.T @ M                                        # solapamiento por par
+R = res_piv.corr(min_periods=4).values               # correlaciones por par
+
+N_cd = R.shape[0]
+iu = np.triu_indices(N_cd, k=1)
+validos = (~np.isnan(R[iu])) & (Tij[iu] >= 4)
+cd_stat = np.sqrt(2 / (N_cd * (N_cd - 1))) * np.nansum(
+    np.sqrt(Tij[iu][validos]) * R[iu][validos])
+p_cd = 2 * (1 - stats.norm.cdf(abs(cd_stat)))
+
+print(f"\n  3. DEPENDENCIA TRANSVERSAL (Pesaran CD):")
+print(f"     CD = {cd_stat:.3f} | p = {p_cd:.2e} | pares válidos: {validos.sum():,}")
+print(f"     {'⚠️  Dependencia transversal → Driscoll-Kraay imprescindible' if p_cd < 0.05 else '✅ Sin dependencia transversal significativa'}")
+
+print("""
+  CONCLUSIÓN: los errores estándar Driscoll-Kraay (kernel Bartlett) corrigen
+  simultáneamente las tres violaciones, por lo que toda la inferencia de H2
+  se realiza con esta matriz de covarianzas.
+""")
+
+# ==============================================================================
+# SECCIÓN 4: REGRESIONES FE + DRISCOLL-KRAAY — 4 SCORES
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 4: Regresiones FE + Driscoll-Kraay (modelo principal RAW)")
+print("─" * 80)
+
+
+def correr_panel(panel, etiqueta='RAW'):
+    """Corre las 4 regresiones FE+DK y devuelve dict de resultados y tabla."""
+    resultados = {}
+    filas = []
+    for score in SCORES:
+        res, datos = ajustar_fe(panel, score, cov='kernel')
+        resultados[score] = {'res': res, 'datos': datos}
+        var_score = f'{score}_lag1'
+        fila = {
+            'score': score, 'version': etiqueta,
+            'beta1': res.params[var_score],
+            't_beta1': res.tstats[var_score],
+            'p_beta1': res.pvalues[var_score],
+            'n': res.nobs,
+            'empresas': datos.reset_index()['RIC'].nunique(),
+            'R2_within': res.rsquared_within,
+            'F_stat': res.f_statistic.stat,
+            'p_F': res.f_statistic.pval,
+        }
+        for c in CONTROLES:
+            fila[f'b_{c}'] = res.params[c]
+            fila[f't_{c}'] = res.tstats[c]
+            fila[f'p_{c}'] = res.pvalues[c]
+        filas.append(fila)
+    return resultados, pd.DataFrame(filas)
+
+
+print("  Estimando 4 regresiones RAW (FE + Driscoll-Kraay)...")
+res_raw, tabla_raw = correr_panel(panel_raw, 'RAW')
+
+print("  Estimando 4 regresiones WINSORIZADO (sensibilidad)...")
+res_w, tabla_w = correr_panel(panel_w, 'WINS')
+
+# ── TABLA 4A: coeficientes completos por score (estilo paper) ─────────────────
+print("\n" + "═" * 80)
+print("TABLA 4A — REGRESIONES PANEL Q DE TOBIN (FE empresa + Driscoll-Kraay)")
+print("═" * 80)
+print("""
+Variable dependiente: Q de Tobin. Cada columna es una regresión independiente
+con el score indicado. t-stats Driscoll-Kraay entre paréntesis conceptuales.
+""")
+
+print(f"  {'Variable':<18} {'ESG Compuesto':>16} {'Pilar E':>16} {'Pilar S':>16} {'Pilar G':>16}")
+print(f"  {'─'*86}")
+
+# β1 (score)
+linea_b, linea_t = f"  {'Score (t-1) β1':<18}", f"  {'':<18}"
+for score in SCORES:
+    r = tabla_raw[tabla_raw['score'] == score].iloc[0]
+    stars = sig_stars(r['p_beta1'])
+    linea_b += f"{r['beta1']:>12.5f}{stars:<4}"
+    linea_t += f"{'(' + format(r['t_beta1'], '.2f') + ')':>16}"
+print(linea_b)
+print(linea_t)
+
+# Controles
+for c in CONTROLES:
+    linea_b, linea_t = f"  {c:<18}", f"  {'':<18}"
+    for score in SCORES:
+        r = tabla_raw[tabla_raw['score'] == score].iloc[0]
+        stars = sig_stars(r[f'p_{c}'])
+        linea_b += f"{r[f'b_{c}']:>12.5f}{stars:<4}"
+        linea_t += f"{'(' + format(r[f't_{c}'], '.2f') + ')':>16}"
+    print(linea_b)
+    print(linea_t)
+
+# Estadísticos del modelo
+print(f"  {'─'*86}")
+for etiqueta, campo, fmt in [('Obs (empresa-año)', 'n', ',.0f'),
+                              ('Empresas', 'empresas', ',.0f'),
+                              ('R² within', 'R2_within', '.4f'),
+                              ('F-stat', 'F_stat', '.2f')]:
+    linea = f"  {etiqueta:<18}"
+    for score in SCORES:
+        r = tabla_raw[tabla_raw['score'] == score].iloc[0]
+        linea += f"{format(r[campo], fmt):>16}"
+    print(linea)
+
+print(f"""
+  Significación: *** p<0.01, ** p<0.05, * p<0.10
+  Todos los modelos incluyen efectos fijos por empresa (μ_i).
+  Errores estándar Driscoll-Kraay (kernel Bartlett, bandwidth automático).
+""")
+
+# ── TABLA 4B: interpretación económica de β1 ──────────────────────────────────
+print("═" * 80)
+print("TABLA 4B — INTERPRETACIÓN ECONÓMICA DE β1")
+print("═" * 80)
+
+q_mediano = panel_raw[VAR_DEP].median()
+print(f"""
+  Efecto de +10 puntos de score (escala 0-100) sobre el Q de Tobin.
+  Q de Tobin mediano de la muestra: {q_mediano:.4f}
+""")
+
+print(f"  {'Score':<15} {'β1':>10} {'Efecto +10pts':>14} {'% sobre Q med':>14} {'Sig':>5}")
+print(f"  {'─'*64}")
+for score in SCORES:
+    r = tabla_raw[tabla_raw['score'] == score].iloc[0]
+    efecto10 = r['beta1'] * 10
+    pct = efecto10 / q_mediano * 100
+    stars = sig_stars(r['p_beta1'])
+    print(f"  {SCORE_LABELS[score]:<15} {r['beta1']:>10.5f} {efecto10:>14.4f} {pct:>13.2f}% {stars:>5}")
+
+# ==============================================================================
+# SECCIÓN 5: DECISIÓN H2 — ZONAS DE LA GUÍA HITO 3
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 5: Decisión H2 según protocolo HITO 3")
+print("─" * 80)
+
+b_E = tabla_raw[tabla_raw['score'] == 'E_Score'].iloc[0]
+b_S = tabla_raw[tabla_raw['score'] == 'S_Score'].iloc[0]
+b_G = tabla_raw[tabla_raw['score'] == 'G_Score'].iloc[0]
+
+zona_verde = ((b_S['beta1'] > 0 and b_S['p_beta1'] < 0.05) or
+              (b_G['beta1'] > 0 and b_G['p_beta1'] < 0.05))
+zona_roja  = (b_E['beta1'] < 0 and b_E['p_beta1'] < 0.05)
+
+print(f"""
+  Criterios (guía HITO 3):
+  · Zona Verde (creación de valor): β1 > 0 significativo en pilar S o G
+    → Pilar S: β1 = {b_S['beta1']:.5f} (p = {b_S['p_beta1']:.4f}) {'✅ cumple' if b_S['beta1'] > 0 and b_S['p_beta1'] < 0.05 else '— no cumple'}
+    → Pilar G: β1 = {b_G['beta1']:.5f} (p = {b_G['p_beta1']:.4f}) {'✅ cumple' if b_G['beta1'] > 0 and b_G['p_beta1'] < 0.05 else '— no cumple'}
+  · Zona Roja (destrucción de valor): β1 < 0 significativo en pilar E
+    → Pilar E: β1 = {b_E['beta1']:.5f} (p = {b_E['p_beta1']:.4f}) {'🔴 cumple' if zona_roja else '— no cumple'}
+
+  RESULTADO:
+""")
+
+if zona_verde and not zona_roja:
+    print("  ✅ ZONA VERDE: el mercado premia la dimensión socio-gubernamental")
+    print("     (consistente con Sandretto et al. 2025)")
+elif zona_roja and not zona_verde:
+    print("  🔴 ZONA ROJA: la transición ambiental penaliza la valuación")
+    print("     (consistente con Oluwakemi & Mishelle 2025)")
+elif zona_verde and zona_roja:
+    print("  🟡 RESULTADO MIXTO: S/G crean valor pero E lo destruye")
+    print("     (ambas literaturas se confirman simultáneamente)")
+else:
+    print("  ⚪ SIN EFECTO SIGNIFICATIVO: ninguno de los pilares mueve el Q de Tobin")
+    print("     (la valoración ya incorpora la información ESG, o el efecto se")
+    print("     captura en el canal rentabilidad —ver H1— y no en el de valuación)")
+
+# ==============================================================================
+# SECCIÓN 6: SENSIBILIDAD — RAW vs WINSORIZADO Y FE TWO-WAY
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 6: Sensibilidad — RAW vs Winsorizado + efectos de tiempo")
+print("─" * 80)
+
+print(f"\n  6A. RAW vs WINSORIZADO (β1, t-DK y p por score):")
+print(f"  {'Score':<15} {'β1_RAW':>10} {'t':>7} {'p':>8} {'β1_WINS':>10} {'t':>7} {'p':>8}   Veredicto")
+print(f"  {'─'*88}")
+for score in SCORES:
+    r_raw  = tabla_raw[tabla_raw['score'] == score].iloc[0]
+    r_wins = tabla_w[tabla_w['score'] == score].iloc[0]
+    sig_raw  = r_raw['p_beta1'] < 0.05
+    sig_wins = r_wins['p_beta1'] < 0.05
+    mismo_signo = np.sign(r_raw['beta1']) == np.sign(r_wins['beta1'])
+    if not sig_raw and not sig_wins:
+        veredicto = "✅ Consistente: sin efecto en ambas"
+    elif sig_raw and sig_wins and mismo_signo:
+        veredicto = "✅ Robusto: significativo en ambas"
+    elif sig_raw != sig_wins:
+        veredicto = "⚠️  Cambia la significación"
+    else:
+        veredicto = "🔴 Cambia el signo"
+    print(f"  {SCORE_LABELS[score]:<15} {r_raw['beta1']:>10.5f} {r_raw['t_beta1']:>7.2f} {r_raw['p_beta1']:>8.4f} "
+          f"{r_wins['beta1']:>10.5f} {r_wins['t_beta1']:>7.2f} {r_wins['p_beta1']:>8.4f}   {veredicto}")
+
+print("""
+  Nota: con β1 ≈ 0 la variación porcentual entre versiones es una métrica
+  engañosa (divide por un número casi nulo). El criterio correcto es comparar
+  la significación estadística: si ambas versiones concluyen "sin efecto",
+  el hallazgo es consistente.
+""")
+
+# 6B. Robustez: FE two-way (empresa + año) para los 4 scores
+print(f"\n  6B. Robustez FE two-way (empresa + año) — los 4 scores:")
+print(f"  {'Score':<15} {'β1 1-way':>10} {'t':>7} {'p':>8} {'β1 2-way':>10} {'t':>7} {'p':>8} {'Sig':>5}")
+print(f"  {'─'*82}")
+
+res_2w_all = {}
+for score in SCORES:
+    cols_m = [VAR_DEP, f'{score}_lag1'] + CONTROLES
+    datos_m = panel_raw[cols_m].dropna()
+    mod_2w = PanelOLS(datos_m[VAR_DEP], datos_m[[f'{score}_lag1'] + CONTROLES],
+                      entity_effects=True, time_effects=True, drop_absorbed=True)
+    r2w = mod_2w.fit(cov_type='kernel', kernel='bartlett')
+    res_2w_all[score] = r2w
+
+    r_1w = tabla_raw[tabla_raw['score'] == score].iloc[0]
+    var_s = f'{score}_lag1'
+    stars = sig_stars(r2w.pvalues[var_s])
+    print(f"  {SCORE_LABELS[score]:<15} {r_1w['beta1']:>10.5f} {r_1w['t_beta1']:>7.2f} {r_1w['p_beta1']:>8.4f} "
+          f"{r2w.params[var_s]:>10.5f} {r2w.tstats[var_s]:>7.2f} {r2w.pvalues[var_s]:>8.4f} {stars:>5}")
+
+# Mantener referencia para el resumen ejecutivo
+res_2w = res_2w_all['ESG_Score']
+
+print("""
+  Lectura: si β1 cambia al añadir efectos de año, parte de la relación entre
+  ESG y Q en el modelo de un solo efecto proviene de tendencias temporales
+  comunes (los scores ESG y el Q de Tobin comparten tendencia en 2016-2025).
+  El two-way aísla la variación within empresa y within año: un β1 negativo
+  aquí es coherente con el alpha negativo del ESG hallado en H1 (Green
+  Premium: el mercado paga sobreprecio por ESG y ajusta la valuación después).
+""")
+
+# 6C. Matriz completa de especificaciones: β1 en las 4 combinaciones
+print(f"\n  6C. Matriz de especificaciones — β1 por score (con significación):")
+print(f"  {'Score':<15} {'1way RAW':>14} {'1way WINS':>14} {'2way RAW':>14} {'2way WINS':>14}")
+print(f"  {'─'*75}")
+
+
+def beta1_con_stars(beta, p):
+    return f"{beta:.5f}{sig_stars(p)}"
+
+
+res_2w_wins = {}
+for score in SCORES:
+    cols_m = [VAR_DEP, f'{score}_lag1'] + CONTROLES
+    datos_mw = panel_w[cols_m].dropna()
+    mod_2ww = PanelOLS(datos_mw[VAR_DEP], datos_mw[[f'{score}_lag1'] + CONTROLES],
+                       entity_effects=True, time_effects=True, drop_absorbed=True)
+    r2ww = mod_2ww.fit(cov_type='kernel', kernel='bartlett')
+    res_2w_wins[score] = r2ww
+
+    var_s = f'{score}_lag1'
+    r_1w_raw  = tabla_raw[tabla_raw['score'] == score].iloc[0]
+    r_1w_wins = tabla_w[tabla_w['score'] == score].iloc[0]
+    r_2w_raw  = res_2w_all[score]
+
+    print(f"  {SCORE_LABELS[score]:<15} "
+          f"{beta1_con_stars(r_1w_raw['beta1'], r_1w_raw['p_beta1']):>14} "
+          f"{beta1_con_stars(r_1w_wins['beta1'], r_1w_wins['p_beta1']):>14} "
+          f"{beta1_con_stars(r_2w_raw.params[var_s], r_2w_raw.pvalues[var_s]):>14} "
+          f"{beta1_con_stars(r2ww.params[var_s], r2ww.pvalues[var_s]):>14}")
+
+print(f"\n  t-stats Driscoll-Kraay de la columna 2way WINS:")
+for score in SCORES:
+    var_s = f'{score}_lag1'
+    r = res_2w_wins[score]
+    print(f"    {SCORE_LABELS[score]:<15} β1 = {r.params[var_s]:>9.5f} | t = {r.tstats[var_s]:>6.2f} | p = {r.pvalues[var_s]:.4f}")
+
+print("""
+  Lectura de la matriz completa:
+  · El signo positivo del 1way WINS desaparece y se invierte al añadir efectos
+    de año → era tendencia temporal compartida (ESG y Q suben juntos en el
+    período), no relación estructural.
+  · ESG Compuesto y Pilar G mantienen β1 NEGATIVO significativo en ambas
+    versiones two-way → hallazgo secundario robusto a outliers, coherente con
+    el alpha negativo de H1 (Green Premium).
+  · Pilares E y S no son robustos en two-way WINS → sin efecto concluyente.
+""")
+
+# ==============================================================================
+# SECCIÓN 7: GRÁFICOS
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 7: Gráficos — H2")
+print("─" * 80)
+
+import os
+RUTA_GRAFICOS = '/content/drive/MyDrive/TFM_STOXX600/HITO4'
+os.makedirs(RUTA_GRAFICOS, exist_ok=True)
+
+colores_score = {'ESG_Score': '#2ecc71', 'E_Score': '#3498db',
+                 'S_Score': '#e67e22', 'G_Score': '#9b59b6'}
+
+# ── Gráfico 1: Forest plot — β1 por pilar con IC 95% (Driscoll-Kraay) ─────────
+print("\n  Gráfico 1: Forest plot de β1 por pilar...")
+
+fig, ax = plt.subplots(figsize=(10, 5.5))
+
+posiciones = np.arange(len(SCORES))[::-1]
+for pos, score in zip(posiciones, SCORES):
+    r = tabla_raw[tabla_raw['score'] == score].iloc[0]
+    se = r['beta1'] / r['t_beta1'] if r['t_beta1'] != 0 else np.nan
+    ic = 1.96 * abs(se)
+    color = colores_score[score]
+    ax.errorbar(r['beta1'], pos, xerr=ic, fmt='o', color=color,
+                markersize=10, capsize=6, linewidth=2.2)
+    stars = sig_stars(r['p_beta1'])
+    ax.annotate(f"β1={r['beta1']:.5f}{stars}  (t={r['t_beta1']:.2f})",
+                xy=(r['beta1'], pos), xytext=(0, 14), textcoords='offset points',
+                ha='center', fontsize=9)
+
+ax.axvline(0, color='black', linewidth=1, linestyle='--', alpha=0.7)
+ax.set_yticks(posiciones)
+ax.set_yticklabels([SCORE_LABELS[s] for s in SCORES])
+ax.set_xlabel('β1 — efecto del score (t−1) sobre el Q de Tobin')
+ax.set_title('H2: Efecto de los scores ESG sobre el Q de Tobin\n'
+             'Panel FE empresa + errores Driscoll-Kraay — IC 95%',
+             fontsize=12, fontweight='bold')
+ax.grid(True, alpha=0.3, axis='x')
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h2_forest_beta1.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 2: Binscatter Q de Tobin vs ESG (crudo y within-empresa) ──────────
+print("\n  Gráfico 2: Binscatter Q vs ESG (crudo vs within)...")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+fig.suptitle('H2: Relación Q de Tobin vs ESG Score (t−1) — 20 bins por cuantiles',
+             fontsize=12, fontweight='bold')
+
+datos_bs = panel_raw[[VAR_DEP, 'ESG_Score_lag1']].dropna().reset_index()
+
+# Panel A: relación cruda
+ax = axes[0]
+datos_bs['bin'] = pd.qcut(datos_bs['ESG_Score_lag1'], 20, labels=False, duplicates='drop')
+binned = datos_bs.groupby('bin').agg(x=('ESG_Score_lag1', 'mean'), y=(VAR_DEP, 'mean'))
+ax.scatter(binned['x'], binned['y'], s=55, color='#2980b9', zorder=3)
+slope, intercept = np.polyfit(datos_bs['ESG_Score_lag1'], datos_bs[VAR_DEP], 1)
+xs = np.linspace(datos_bs['ESG_Score_lag1'].min(), datos_bs['ESG_Score_lag1'].max(), 50)
+ax.plot(xs, intercept + slope * xs, color='#c0392b', linewidth=1.6,
+        label=f'Pendiente cruda: {slope:.5f}')
+ax.set_title('A. Relación cruda (entre empresas)', fontsize=10)
+ax.set_xlabel('ESG Score (t−1)')
+ax.set_ylabel('Q de Tobin medio del bin')
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+
+# Panel B: relación within (demeaned por empresa = lo que estima el FE)
+ax = axes[1]
+datos_w_bs = datos_bs.copy()
+for col in [VAR_DEP, 'ESG_Score_lag1']:
+    datos_w_bs[col] = datos_w_bs[col] - datos_w_bs.groupby('RIC')[col].transform('mean')
+datos_w_bs['bin'] = pd.qcut(datos_w_bs['ESG_Score_lag1'], 20, labels=False, duplicates='drop')
+binned_w = datos_w_bs.groupby('bin').agg(x=('ESG_Score_lag1', 'mean'), y=(VAR_DEP, 'mean'))
+ax.scatter(binned_w['x'], binned_w['y'], s=55, color='#27ae60', zorder=3)
+slope_w, intercept_w = np.polyfit(datos_w_bs['ESG_Score_lag1'], datos_w_bs[VAR_DEP], 1)
+xs_w = np.linspace(datos_w_bs['ESG_Score_lag1'].min(), datos_w_bs['ESG_Score_lag1'].max(), 50)
+ax.plot(xs_w, intercept_w + slope_w * xs_w, color='#c0392b', linewidth=1.6,
+        label=f'Pendiente within: {slope_w:.5f}')
+ax.axhline(0, color='gray', linewidth=0.7, linestyle=':')
+ax.axvline(0, color='gray', linewidth=0.7, linestyle=':')
+ax.set_title('B. Relación within-empresa (la que estima el FE)', fontsize=10)
+ax.set_xlabel('ESG Score (t−1), desviación vs media de la empresa')
+ax.set_ylabel('Q de Tobin, desviación vs media de la empresa')
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h2_binscatter_q_esg.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 3: Evolución del Q de Tobin mediano por tercil ESG ────────────────
+print("\n  Gráfico 3: Evolución temporal del Q por tercil ESG...")
+
+datos_ev = panel_raw[[VAR_DEP, 'ESG_Score_lag1']].dropna().reset_index()
+datos_ev['tercil'] = datos_ev.groupby('Year')['ESG_Score_lag1'].transform(
+    lambda s: pd.qcut(s, 3, labels=['T3 (ESG bajo)', 'T2 (medio)', 'T1 (ESG alto)']))
+
+evolucion = datos_ev.groupby(['Year', 'tercil'])[VAR_DEP].median().unstack()
+
+fig, ax = plt.subplots(figsize=(11, 5.5))
+colores_t = {'T1 (ESG alto)': '#1a9641', 'T2 (medio)': '#fdae61', 'T3 (ESG bajo)': '#d73027'}
+for tercil in ['T1 (ESG alto)', 'T2 (medio)', 'T3 (ESG bajo)']:
+    if tercil in evolucion.columns:
+        ax.plot(evolucion.index, evolucion[tercil], marker='o', linewidth=2,
+                color=colores_t[tercil], label=tercil)
+
+ax.set_title('H2: Q de Tobin mediano por tercil de ESG Score (t−1)\n'
+             'STOXX 600, 2016–2025', fontsize=12, fontweight='bold')
+ax.set_xlabel('Año')
+ax.set_ylabel('Q de Tobin mediano')
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h2_evolucion_q_terciles.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 4 (anexo): Distribución del Q de Tobin RAW vs winsorizado ─────────
+print("\n  Gráfico 4 (anexo): Distribución del Q de Tobin RAW vs winsorizado...")
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('H2 (anexo): Distribución del Q de Tobin — efecto de la winsorización P1-P99',
+             fontsize=12, fontweight='bold')
+
+for ax, (panel_d, titulo, color) in zip(
+        axes, [(panel_raw, 'RAW (modelo principal)', '#2980b9'),
+               (panel_w, 'Winsorizado (sensibilidad)', '#27ae60')]):
+    s = panel_d[VAR_DEP].dropna()
+    ax.hist(s, bins=60, color=color, edgecolor='black', alpha=0.75)
+    ax.axvline(s.median(), color='red', linestyle='--', lw=1.5,
+               label=f'Mediana: {s.median():.3f}')
+    ax.set_title(f'{titulo}  (n={len(s):,})', fontsize=10)
+    ax.set_xlabel('Q de Tobin')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h2_dist_qtobin.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ==============================================================================
+# SECCIÓN 8: RESUMEN EJECUTIVO H2
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("RESUMEN EJECUTIVO — HIPÓTESIS 2")
+print("=" * 80)
+
+print("\n  β1 por score (FE empresa + Driscoll-Kraay, modelo RAW):")
+print(f"  {'Score':<15} {'β1':>11} {'t-DK':>8} {'p':>9} {'Sig':>5} {'Efecto +10pts':>14}")
+print(f"  {'─'*68}")
+for score in SCORES:
+    r = tabla_raw[tabla_raw['score'] == score].iloc[0]
+    stars = sig_stars(r['p_beta1'])
+    print(f"  {SCORE_LABELS[score]:<15} {r['beta1']:>11.5f} {r['t_beta1']:>8.3f} "
+          f"{r['p_beta1']:>9.4f} {stars:>5} {r['beta1']*10:>14.4f}")
+
+print(f"""
+  Hausman: FE preferido en {'todos los scores' if all(v['p'] < 0.05 for v in hausman_resultados.values()) else 'parte de los scores (revisar tabla Sección 2)'}
+  Diagnósticos: AR(1) {'sí' if p_rho < 0.05 else 'no'} | Heterocedasticidad {'sí' if bp_p < 0.05 else 'no'} | Dependencia transversal {'sí' if p_cd < 0.05 else 'no'}
+  → Inferencia con errores Driscoll-Kraay justificada empíricamente.
+
+  CONCLUSIÓN H2 (matriz de especificaciones, Sección 6C):
+  · Modelo principal pre-especificado (FE empresa + DK, RAW): SIN EFECTO
+    significativo de ningún pilar sobre el Q de Tobin → H2 no se sostiene
+    en su formulación original (ni zona verde ni zona roja).
+  · El efecto positivo del 1-way winsorizado es tendencia temporal compartida:
+    desaparece y se invierte al controlar por efectos de año.
+  · Hallazgo secundario robusto: ESG Compuesto (β1={res_2w.params['ESG_Score_lag1']:.5f}, t={res_2w.tstats['ESG_Score_lag1']:.2f} RAW;
+    β1={res_2w_wins['ESG_Score'].params['ESG_Score_lag1']:.5f}, t={res_2w_wins['ESG_Score'].tstats['ESG_Score_lag1']:.2f} WINS) y Pilar G muestran efecto
+    NEGATIVO within-año robusto a outliers → coherente con el alpha negativo
+    de H1 (Green Premium: sobrevaluación de empresas con alto ESG).
+""")
+
+print(f"Fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)
+
+# ==============================================================================
+# SECCIÓN 9: ANEXO — SUMMARIES COMPLETOS (linearmodels)
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("SECCIÓN 9: ANEXO — Summaries completos de las regresiones panel")
+print("=" * 80)
+print("""
+Output completo de linearmodels (formato análogo al summary de statsmodels
+del Taller de regresión) para las 4 regresiones principales.
+""")
+
+for score in SCORES:
+    print(f"\n{'═'*78}")
+    print(f"  H2 — {SCORE_LABELS[score]} (FE empresa + Driscoll-Kraay)")
+    print(f"{'═'*78}")
+    print(res_raw[score]['res'])

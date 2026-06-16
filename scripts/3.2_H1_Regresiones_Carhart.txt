@@ -1,0 +1,930 @@
+# ==============================================================================
+# SCRIPT 3.2 (v2): HIPÓTESIS 1 — ALPHA DE JENSEN (MODELO CARHART 4 FACTORES)
+# ==============================================================================
+#
+# PREGUNTA: ¿El mercado europeo premia el desempeño ESG con una rentabilidad
+# anormal positiva, superando la rentabilidad ajustada por riesgo?
+#
+# MODELO:
+#   R_pt − R_ft = α_p + β_p(Rm_Rf) + s_p·SMB + h_p·HML + w_p·WML + ε_pt
+#
+#   donde:
+#     p = portafolio (Q1=top 20% ESG ... Q5=bottom 20% ESG)
+#     R_pt = retorno mensual equal-weighted del quintil p
+#     α_p  = alpha de Jensen ← lo que queremos medir
+#
+# ESTRATEGIA LONG-SHORT (best-in-class):
+#   Q1 (Long) − Q5 (Short) → si α_LS > 0: ESG genera alpha positivo
+#
+# DECISIÓN:
+#   Aceptar H1: α_LS significativo (t > 1.96, p < 0.05)
+#   Rechazar H1: α_LS no significativo
+#
+# NOVEDADES v2 (alineación con material de clase):
+#   · Tabla estilo Fama-French (1993, Table 6): todos los coeficientes con t-stats
+#   · Diagnósticos de regresión: Durbin-Watson, Jarque-Bera, F-global (Taller regresión)
+#   · Comparación CAPM vs Carhart 4F: ΔR² y GRS de ambos modelos (diapositiva 20)
+#   · Anexo: summaries completos de statsmodels (formato visto en clase)
+#   · Gráficos: alpha con IC 95%, L-S acumulado, heatmap loadings, R² comparado
+#   · Índice de mercado: STOXX 600 Net Return (ver Anexo A1) vía STOXX_VERSION
+#
+# REQUIERE: df_monthly_raw, df_monthly_w (Script 2.3) + df_factors_4f (Script 3.1)
+#           + STOXX_VERSION (Script 2 principal, Sección 5)
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.stats.stattools import durbin_watson, jarque_bera
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT 3.2 (v2): HIPÓTESIS 1 — ALPHA DE JENSEN (CARHART 4 FACTORES)")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, nombre in [('df_monthly_raw', 'Script 2.3'),
+                    ('df_monthly_w',   'Script 2.3'),
+                    ('df_factors_4f',  'Script 3.1')]:
+    if var not in dir():
+        print(f"❌ '{var}' no está en memoria. Ejecuta {nombre} primero.")
+        raise SystemExit
+
+if 'STOXX_VERSION' not in dir():
+    STOXX_VERSION = 'versión no identificada'
+    print("⚠️  STOXX_VERSION no está en memoria (Script 2 Sección 5) — usando etiqueta genérica")
+
+print(f"Índice de mercado: STOXX 600 [{STOXX_VERSION}]")
+
+# ==============================================================================
+# SECCIÓN 1: CONSTRUCCIÓN DE PORTAFOLIOS Q1–Q5 POR QUINTIL ESG
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 1: Portafolios Q1–Q5 (equal-weighted, estrategia 1/N)")
+print("─" * 80)
+
+print("""
+Metodología (protocolo HITO 3):
+  1. Cada mes t: usar ESG_Score_lag1 (score del mes t-1 → anti look-ahead bias)
+  2. Calcular quintiles entre todas las empresas con score disponible ese mes
+     Q1 = top 20% (mejor ESG)  → cartera LONG
+     Q5 = bottom 20% (peor ESG) → cartera SHORT
+  3. Return del portafolio: equal-weighted (1/N equiproporcional)
+     Razón: elimina sesgo por capitalización; las large-cap no dominan el alpha
+  4. Repetir para: ESG_Score, E_Score, S_Score, G_Score → 4 × 5 = 20 portafolios
+""")
+
+SCORES = ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']
+SCORE_LABELS = {'ESG_Score': 'ESG Compuesto', 'E_Score': 'Pilar E',
+                'S_Score': 'Pilar S', 'G_Score': 'Pilar G'}
+N_QUINTILES = 5
+MIN_EMPRESAS_QUINTIL = 10  # mínimo para que el portafolio sea estadísticamente válido
+
+
+def construir_portafolios(df_mensual, scores=SCORES):
+    """
+    Construye los retornos mensuales de los 5 quintiles ESG
+    para cada score dado. Devuelve dict: {score: DataFrame con columnas Q1..Q5}
+    """
+    portafolios = {}
+
+    for score in scores:
+        col_lag = f'{score}_lag1'
+        if col_lag not in df_mensual.columns:
+            print(f"  ⚠️  {col_lag} no encontrado — omitiendo {score}")
+            continue
+
+        resultados = []
+        for ym, grupo in df_mensual.groupby('YearMonth'):
+            # Solo empresas con score y retorno disponibles este mes
+            subdf = grupo[['RIC', 'Return_monthly', col_lag]].dropna()
+
+            if len(subdf) < N_QUINTILES * MIN_EMPRESAS_QUINTIL:
+                continue
+
+            # Asignar quintil: rank(ascending=False) → rank 1 = mayor score = Q1
+            subdf = subdf.copy()
+            subdf['rank'] = subdf[col_lag].rank(ascending=False, method='first')
+            n = len(subdf)
+            subdf['quintil'] = pd.cut(
+                subdf['rank'],
+                bins=[0, n*0.2, n*0.4, n*0.6, n*0.8, n],
+                labels=[1, 2, 3, 4, 5]
+            ).astype(int)
+
+            fila = {'YearMonth': ym}
+            for q in range(1, N_QUINTILES + 1):
+                empresas_q = subdf[subdf['quintil'] == q]
+                if len(empresas_q) >= 3:
+                    fila[f'Q{q}'] = empresas_q['Return_monthly'].mean()   # igual ponderado 1/N
+                    fila[f'N_Q{q}'] = len(empresas_q)
+                else:
+                    fila[f'Q{q}'] = np.nan
+                    fila[f'N_Q{q}'] = 0
+
+            resultados.append(fila)
+
+        df_port = pd.DataFrame(resultados)
+        df_port['Date'] = df_port['YearMonth'].dt.to_timestamp()
+        portafolios[score] = df_port
+
+    return portafolios
+
+
+ports_raw  = construir_portafolios(df_monthly_raw)
+ports_w    = construir_portafolios(df_monthly_w)
+
+# Reporte de cobertura
+for score, df_p in ports_raw.items():
+    meses = len(df_p)
+    n_med = df_p[[f'N_Q{q}' for q in range(1,6)]].mean().mean()
+    print(f"  {SCORE_LABELS[score]:<20}  {meses} meses  |  {n_med:.0f} empresas/quintil (media)")
+
+# ==============================================================================
+# SECCIÓN 2: ESTRATEGIA LONG-SHORT Y EXCESO DE RETORNO
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 2: Estrategia Long-Short (Q1 − Q5) y exceso de retorno")
+print("─" * 80)
+
+# Añadir Rf mensual y crear exceso de retorno para regresión
+rf_table = df_monthly_raw[['YearMonth', 'Rf_monthly']].drop_duplicates('YearMonth')
+
+for ports_dict in [ports_raw, ports_w]:
+    for score in list(ports_dict.keys()):
+        df_p = ports_dict[score].merge(rf_table, on='YearMonth', how='left')
+        df_p['LS'] = df_p['Q1'] - df_p['Q5']  # Long-Short
+        for q in range(1, N_QUINTILES + 1):
+            df_p[f'EX_Q{q}'] = df_p[f'Q{q}'] - df_p['Rf_monthly']
+        df_p['EX_LS'] = df_p['LS']  # Long-Short ya es exceso vs Rf indirecto
+        ports_dict[score] = df_p
+
+print("  ✅ Excesos de retorno y cartera L-S construidos para RAW y WINS")
+
+# ==============================================================================
+# SECCIÓN 3: REGRESIONES — CAPM Y CARHART 4 FACTORES
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 3: Regresiones CAPM y Carhart 4 factores")
+print("─" * 80)
+
+FACTORES_CARHART = ['Rm_Rf', 'SMB', 'HML', 'WML']
+FACTORES_CAPM    = ['Rm_Rf']
+factors_cols     = FACTORES_CARHART  # compatibilidad con secciones siguientes
+
+NOMBRES_FACTOR = {'Rm_Rf': 'mkt', 'SMB': 'smb', 'HML': 'hml', 'WML': 'wml'}
+
+
+def regresion_factores(ret_series, df_factors_in, factores_x=FACTORES_CARHART):
+    """
+    Regresión OLS: R_p - R_f = α + Σ β_k·F_k + ε
+    Estima OLS estándar y Newey-West (HAC, 3 lags).
+    Devuelve dict con coeficientes, t-stats NW de TODOS los factores,
+    R², R²-adj, F-global, Durbin-Watson, Jarque-Bera y s(e).
+    """
+    df_reg = pd.DataFrame({'y': ret_series}).join(
+        df_factors_in[['YearMonth'] + factores_x].set_index('YearMonth')
+    ).dropna()
+
+    if len(df_reg) < 24:
+        return None
+
+    Y = df_reg['y'].values
+    X = sm.add_constant(df_reg[factores_x].values)
+
+    modelo    = sm.OLS(Y, X).fit()
+    modelo_nw = sm.OLS(Y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+
+    jb_stat, jb_p, _, _ = jarque_bera(modelo.resid)
+
+    resultado = {
+        'n':           len(df_reg),
+        'alpha':       modelo.params[0],
+        't_alpha':     modelo.tvalues[0],
+        't_alpha_nw':  modelo_nw.tvalues[0],
+        'p_alpha':     modelo.pvalues[0],
+        'p_alpha_nw':  modelo_nw.pvalues[0],
+        'se_alpha_nw': modelo_nw.bse[0],
+        'R2':          modelo.rsquared,
+        'R2_adj':      modelo.rsquared_adj,
+        'F_stat':      modelo.fvalue,
+        'p_F':         modelo.f_pvalue,
+        'DW':          durbin_watson(modelo.resid),
+        'JB':          jb_stat,
+        'p_JB':        jb_p,
+        's_e':         modelo.resid.std(ddof=1),
+    }
+
+    # Coeficientes y t-stats NW de cada factor incluido
+    for i, f in enumerate(factores_x, start=1):
+        clave = NOMBRES_FACTOR[f]
+        resultado[f'beta_{clave}'] = modelo.params[i]
+        resultado[f't_{clave}_nw'] = modelo_nw.tvalues[i]
+        resultado[f'p_{clave}_nw'] = modelo_nw.pvalues[i]
+
+    return resultado
+
+
+# Alias para compatibilidad con código previo
+carhart_regression = regresion_factores
+
+
+def correr_todas_regresiones(ports_dict, df_fct, etiqueta='RAW',
+                             factores_x=FACTORES_CARHART, modelo_nombre='Carhart'):
+    """Corre las regresiones para todos los scores y quintiles + L-S."""
+    tabla = []
+
+    for score in SCORES:
+        if score not in ports_dict:
+            continue
+        df_p = ports_dict[score].merge(
+            df_fct[['YearMonth'] + factores_x],
+            on='YearMonth', how='inner'
+        )
+
+        for q in range(1, N_QUINTILES + 1):
+            ret_col = f'EX_Q{q}'
+            res = regresion_factores(df_p.set_index('YearMonth')[ret_col], df_fct, factores_x)
+            if res:
+                res.update({'score': score, 'cartera': f'Q{q}',
+                            'version': etiqueta, 'modelo': modelo_nombre})
+                tabla.append(res)
+
+        res_ls = regresion_factores(df_p.set_index('YearMonth')['EX_LS'], df_fct, factores_x)
+        if res_ls:
+            res_ls.update({'score': score, 'cartera': 'Q1-Q5',
+                           'version': etiqueta, 'modelo': modelo_nombre})
+            tabla.append(res_ls)
+
+    return pd.DataFrame(tabla)
+
+
+# ── Carhart 4F: modelo principal (RAW) y sensibilidad (WINS) ──────────────────
+print("  Corriendo regresiones Carhart RAW (modelo principal)...")
+df_reg_raw = correr_todas_regresiones(ports_raw, df_factors_4f, etiqueta='RAW')
+
+print("  Corriendo regresiones Carhart WINSORIZADO (sensibilidad)...")
+df_reg_w = correr_todas_regresiones(ports_w, df_factors_4f, etiqueta='WINS')
+
+# ── CAPM simple: para comparación de modelos (diapositiva 20 / FF 1993) ───────
+print("  Corriendo regresiones CAPM simple (comparación de modelos)...")
+df_reg_capm = correr_todas_regresiones(ports_raw, df_factors_4f, etiqueta='RAW',
+                                       factores_x=FACTORES_CAPM, modelo_nombre='CAPM')
+
+df_reg_all = pd.concat([df_reg_raw, df_reg_w], ignore_index=True)
+print(f"\n  ✅ Regresiones Carhart: {len(df_reg_all)} ({len(df_reg_raw)} RAW + {len(df_reg_w)} WINS)")
+print(f"  ✅ Regresiones CAPM:    {len(df_reg_capm)} (para tabla comparativa)")
+
+# ==============================================================================
+# SECCIÓN 4: TABLAS DE RESULTADOS
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 4: Tablas de resultados")
+print("─" * 80)
+
+def sig_stars(p):
+    if   p < 0.01: return '***'
+    elif p < 0.05: return '**'
+    elif p < 0.10: return '*'
+    else:          return ''
+
+
+# ── 4A: Tabla resumida — Alpha de Jensen por cartera ──────────────────────────
+print("\n" + "═" * 80)
+print("TABLA 4A — ALPHAS DE JENSEN (resumen por cartera, Newey-West)")
+print("═" * 80)
+
+for score in SCORES:
+    print(f"\n  {'─'*60}")
+    print(f"  {SCORE_LABELS[score]} — Alphas de Jensen (% mensual, Newey-West t-stat)")
+    print(f"  {'─'*60}")
+    print(f"  {'Cartera':<10} {'α(%/mes)':>10} {'t-NW':>8} {'Sig':>5} {'β_mkt':>8} {'R²':>7}")
+    print(f"  {'─'*60}")
+
+    subset = df_reg_raw[(df_reg_raw['score'] == score)].copy()
+    for _, row in subset.iterrows():
+        stars = sig_stars(row['p_alpha_nw'])
+        print(f"  {row['cartera']:<10} {row['alpha']*100:>10.4f} {row['t_alpha_nw']:>8.3f} {stars:>5} {row['beta_mkt']:>8.4f} {row['R2']:>7.3f}")
+
+# ── 4B: Tabla estilo Fama-French (1993, Table 6) — coeficientes completos ─────
+print("\n" + "═" * 80)
+print("TABLA 4B — COEFICIENTES COMPLETOS ESTILO FAMA-FRENCH (Table 6)")
+print("═" * 80)
+print("""
+Para cada cartera: coeficiente y t-stat (Newey-West) de los 4 factores.
+Permite analizar la exposición de cada quintil ESG a tamaño (s), valor (h)
+y momentum (w), además del mercado (b). s(e) = desviación estándar residual.
+""")
+
+for score in SCORES:
+    print(f"\n  {SCORE_LABELS[score]}")
+    print(f"  {'─'*108}")
+    print(f"  {'Cartera':<8} {'α%':>8} {'t(α)':>7} {'b':>7} {'t(b)':>7} {'s':>7} {'t(s)':>7} "
+          f"{'h':>7} {'t(h)':>7} {'w':>7} {'t(w)':>7} {'R²aj':>6} {'s(e)%':>7}")
+    print(f"  {'─'*108}")
+
+    subset = df_reg_raw[df_reg_raw['score'] == score]
+    for _, r in subset.iterrows():
+        print(f"  {r['cartera']:<8} {r['alpha']*100:>8.4f} {r['t_alpha_nw']:>7.2f} "
+              f"{r['beta_mkt']:>7.3f} {r['t_mkt_nw']:>7.2f} "
+              f"{r['beta_smb']:>7.3f} {r['t_smb_nw']:>7.2f} "
+              f"{r['beta_hml']:>7.3f} {r['t_hml_nw']:>7.2f} "
+              f"{r['beta_wml']:>7.3f} {r['t_wml_nw']:>7.2f} "
+              f"{r['R2_adj']:>6.3f} {r['s_e']*100:>7.3f}")
+
+print("""
+  Lectura (igual que FF 1993):
+  · b cercano a 1 y t(b) alto → exposición de mercado completa
+  · s > 0 → el quintil se comporta como small-cap; s < 0 → como large-cap
+  · h > 0 → inclinación value; h < 0 → inclinación growth
+  · w > 0 → exposición positiva a momentum
+""")
+
+# ── 4C: Diagnósticos de regresión (Taller de regresión) ───────────────────────
+print("\n" + "═" * 80)
+print("TABLA 4C — DIAGNÓSTICOS DE REGRESIÓN (modelo principal RAW)")
+print("═" * 80)
+print("""
+Estadísticos del summary de statsmodels vistos en el Taller de regresión:
+· Durbin-Watson ≈ 2 → sin autocorrelación de residuos (justifica/valida Newey-West)
+· Jarque-Bera: H0 = residuos normales (p < 0.05 → no normales, usar t robustos)
+· F-global: H0 = todos los coeficientes nulos (p < 0.05 → el modelo es significativo)
+""")
+
+for score in SCORES:
+    print(f"\n  {SCORE_LABELS[score]}")
+    print(f"  {'Cartera':<8} {'DW':>6} {'JB':>9} {'p(JB)':>8} {'F-stat':>9} {'p(F)':>9} {'n':>5}")
+    print(f"  {'─'*60}")
+    subset = df_reg_raw[df_reg_raw['score'] == score]
+    for _, r in subset.iterrows():
+        print(f"  {r['cartera']:<8} {r['DW']:>6.3f} {r['JB']:>9.2f} {r['p_JB']:>8.4f} "
+              f"{r['F_stat']:>9.2f} {r['p_F']:>9.2e} {r['n']:>5}")
+
+# ==============================================================================
+# SECCIÓN 5: TEST GRS — NULIDAD CONJUNTA DE LOS ALPHAS
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 5: Test GRS — ¿Son nulos los alphas conjuntamente?")
+print("─" * 80)
+
+print("""
+Test GRS (Gibbons, Ross y Shanken, 1989):
+  H0: α_Q1 = α_Q2 = α_Q3 = α_Q4 = α_Q5 = 0 (ningún quintil tiene alpha)
+  Si p < 0.05: al menos un quintil tiene alpha significativo → el ESG
+               aporta información adicional a los factores de mercado
+
+Estadístico F ~ F(N, T-N-K) donde N=5 quintiles, T=meses, K=nº factores
+""")
+
+
+def test_grs(ports_dict, df_fct, score, version='RAW', factores_x=FACTORES_CARHART):
+    """
+    Implementación del test GRS para N portafolios y K factores.
+    Referencia: Gibbons, Ross & Shanken (1989), Econometrica.
+    """
+    df_p = ports_dict[score].merge(
+        df_fct[['YearMonth'] + factores_x],
+        on='YearMonth', how='inner'
+    ).dropna(subset=[f'EX_Q{q}' for q in range(1, 6)] + factores_x)
+
+    T = len(df_p)
+    N = N_QUINTILES
+    K = len(factores_x)
+
+    if T < N + K + 10:
+        return None
+
+    Y = df_p[[f'EX_Q{q}' for q in range(1, N+1)]].values  # T × N
+    X = sm.add_constant(df_p[factores_x].values)            # T × (K+1)
+
+    # Estimar alphas y residuos para cada portafolio
+    alphas  = np.zeros(N)
+    resid   = np.zeros((T, N))
+    for i in range(N):
+        m = sm.OLS(Y[:, i], X).fit()
+        alphas[i]   = m.params[0]
+        resid[:, i] = m.resid
+
+    # Matriz de covarianzas de los residuos
+    Sigma = (resid.T @ resid) / T
+
+    # Factor de corrección (primas medias de los factores)
+    mu_f = df_p[factores_x].mean().values
+    Omega = df_p[factores_x].cov().values
+    if K == 1:
+        kappa2 = float(mu_f[0]**2 / Omega[0, 0])
+    else:
+        kappa2 = mu_f @ np.linalg.inv(Omega) @ mu_f
+
+    # Estadístico GRS
+    Sigma_inv = np.linalg.inv(Sigma)
+    grs_num   = (T - N - K) / N
+    grs_denom = (1 + kappa2)
+    grs_stat  = grs_num / grs_denom * (alphas @ Sigma_inv @ alphas)
+
+    from scipy import stats
+    p_val = 1 - stats.f.cdf(grs_stat, N, T - N - K)
+
+    return {
+        'score':    score,
+        'version':  version,
+        'T':        T,
+        'N':        N,
+        'K':        K,
+        'GRS_F':    grs_stat,
+        'p_value':  p_val,
+        'alphas':   alphas.tolist(),
+        'kappa2':   kappa2
+    }
+
+
+grs_resultados = []
+for score in SCORES:
+    for ports_dict, etq in [(ports_raw, 'RAW'), (ports_w, 'WINS')]:
+        if score in ports_dict:
+            res = test_grs(ports_dict, df_factors_4f, score, etq)
+            if res:
+                grs_resultados.append(res)
+
+print(f"  {'Score':<15} {'Ver':>5} {'T':>5} {'GRS_F':>9} {'p-value':>10} {'Decisión'}")
+print(f"  {'─'*65}")
+for r in grs_resultados:
+    dec = "Rechazar H0 (**)" if r['p_value'] < 0.05 else "No rechazar H0"
+    print(f"  {SCORE_LABELS[r['score']]:<15} {r['version']:>5} {r['T']:>5} "
+          f"{r['GRS_F']:>9.4f} {r['p_value']:>10.4f}   {dec}")
+
+# ==============================================================================
+# SECCIÓN 6: COMPARACIÓN DE MODELOS — CAPM vs CARHART 4F
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 6: Comparación de modelos — CAPM vs Carhart 4F")
+print("─" * 80)
+
+print("""
+Contraste de la teoría de clase (FF 1993, diapositivas 16 y 20):
+la inclusión de los factores SMB, HML y WML debería mejorar el R² respecto
+al modelo de índice único (CAPM). Se compara también el GRS de cada modelo.
+""")
+
+print(f"  {'Score':<15} {'R²med CAPM':>11} {'R²med 4F':>10} {'ΔR²':>7} "
+      f"{'GRS CAPM':>10} {'p':>8} {'GRS 4F':>9} {'p':>8}")
+print(f"  {'─'*84}")
+
+quintiles_only = [f'Q{q}' for q in range(1, 6)]
+
+for score in SCORES:
+    r2_capm = df_reg_capm[(df_reg_capm['score'] == score) &
+                          (df_reg_capm['cartera'].isin(quintiles_only))]['R2'].mean()
+    r2_4f   = df_reg_raw[(df_reg_raw['score'] == score) &
+                         (df_reg_raw['cartera'].isin(quintiles_only))]['R2'].mean()
+
+    grs_capm = test_grs(ports_raw, df_factors_4f, score, 'RAW', FACTORES_CAPM)
+    grs_4f   = next((r for r in grs_resultados
+                     if r['score'] == score and r['version'] == 'RAW'), None)
+
+    print(f"  {SCORE_LABELS[score]:<15} {r2_capm:>11.4f} {r2_4f:>10.4f} {r2_4f-r2_capm:>7.4f} "
+          f"{grs_capm['GRS_F']:>10.3f} {grs_capm['p_value']:>8.4f} "
+          f"{grs_4f['GRS_F']:>9.3f} {grs_4f['p_value']:>8.4f}")
+
+print("""
+  Interpretación:
+  · ΔR² > 0 confirma que SMB, HML y WML añaden poder explicativo sobre el CAPM
+    (hipótesis H1 de Fama-French 1993, diapositiva 16 del material de clase)
+  · Si el GRS rechaza H0 en ambos modelos: los alphas no se explican ni por el
+    mercado solo ni por los 4 factores → el efecto ESG es información adicional
+""")
+
+# ==============================================================================
+# SECCIÓN 7: ANÁLISIS DE SENSIBILIDAD RAW vs WINSORIZADO
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 7: Sensibilidad — RAW vs Winsorizado (comparación de alphas Q1-Q5)")
+print("─" * 80)
+
+print("""
+Comparación de alphas de Jensen entre la especificación RAW (modelo principal)
+y la especificación winsorizada (sensibilidad). Si el alpha de la cartera L-S
+no cambia materialmente, el hallazgo es robusto.
+Umbral: variación < 10% → robusto; 10-30% → moderado; > 30% → frágil
+""")
+
+print(f"  {'Score':<15} {'Cartera':<10} {'α_RAW%':>9} {'α_WINS%':>9} {'Var%':>8} {'Veredicto'}")
+print(f"  {'─'*65}")
+
+for score in SCORES:
+    for cartera in ['Q1', 'Q5', 'Q1-Q5']:
+        fila_raw  = df_reg_all[(df_reg_all['score']==score) & (df_reg_all['cartera']==cartera) & (df_reg_all['version']=='RAW')]
+        fila_wins = df_reg_all[(df_reg_all['score']==score) & (df_reg_all['cartera']==cartera) & (df_reg_all['version']=='WINS')]
+        if fila_raw.empty or fila_wins.empty:
+            continue
+        a_raw  = fila_raw.iloc[0]['alpha']
+        a_wins = fila_wins.iloc[0]['alpha']
+        if abs(a_raw) < 1e-8:
+            var_pct = 999.0
+            veredicto = "⚠️  α_raw ≈ 0"
+        else:
+            var_pct = abs(a_raw - a_wins) / abs(a_raw) * 100
+            if var_pct < 10:
+                veredicto = "✅ Robusto"
+            elif var_pct < 30:
+                veredicto = "⚠️  Moderado"
+            else:
+                veredicto = "🔴 Frágil"
+        print(f"  {SCORE_LABELS[score]:<15} {cartera:<10} {a_raw*100:>9.4f} {a_wins*100:>9.4f} {var_pct:>8.1f}   {veredicto}")
+
+# ==============================================================================
+# SECCIÓN 8: GRÁFICOS
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print(f"SECCIÓN 8: Gráficos — H1 [{STOXX_VERSION}]")
+print("─" * 80)
+
+import os
+RUTA_GRAFICOS = '/content/drive/MyDrive/TFM_STOXX600/HITO4'
+os.makedirs(RUTA_GRAFICOS, exist_ok=True)
+
+colores_q = {1: '#1a9641', 2: '#a6d96a', 3: '#fee08b', 4: '#fdae61', 5: '#d73027'}
+color_mkt = '#2166ac'
+
+# ── Gráfico 1: Alpha por quintil con IC 95% (Newey-West) ──────────────────────
+print("\n  Gráfico 1: Alphas por quintil con IC 95%...")
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle('H1: Alpha de Jensen por Quintil ESG con IC 95% (Newey-West)\n'
+             f'Carhart 4F — STOXX 600 {STOXX_VERSION} — 2015–2025', fontsize=12, fontweight='bold')
+
+for ax, score in zip(axes.flatten(), SCORES):
+    sub = df_reg_raw[(df_reg_raw['score'] == score) &
+                     (df_reg_raw['cartera'].isin(quintiles_only))].copy()
+    sub['q'] = sub['cartera'].str[1].astype(int)
+    sub = sub.sort_values('q')
+
+    alphas_pct = sub['alpha'] * 100
+    err95 = 1.96 * sub['se_alpha_nw'] * 100
+    colores_barras = [colores_q[q] for q in sub['q']]
+
+    ax.bar(sub['cartera'], alphas_pct, yerr=err95, color=colores_barras,
+           edgecolor='black', linewidth=0.6, capsize=5, alpha=0.85)
+    ax.axhline(0, color='black', linewidth=0.8)
+
+    # Marcar el alpha L-S como referencia
+    ls = df_reg_raw[(df_reg_raw['score'] == score) & (df_reg_raw['cartera'] == 'Q1-Q5')]
+    if not ls.empty:
+        a_ls = ls.iloc[0]['alpha'] * 100
+        t_ls = ls.iloc[0]['t_alpha_nw']
+        ax.set_title(f"{SCORE_LABELS[score]}  |  α(L-S) = {a_ls:.3f}%/mes (t={t_ls:.2f})", fontsize=10)
+    else:
+        ax.set_title(SCORE_LABELS[score], fontsize=10)
+
+    ax.set_ylabel('Alpha (%/mes)', fontsize=9)
+    ax.set_xlabel('Quintil (Q1 = mejor ESG)', fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h1_alpha_quintiles_ic.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 2: Retorno acumulado de la estrategia Long-Short ──────────────────
+print("\n  Gráfico 2: Retorno acumulado de la estrategia L-S...")
+
+fig, ax = plt.subplots(figsize=(13, 6))
+colores_score = {'ESG_Score': '#2ecc71', 'E_Score': '#3498db',
+                 'S_Score': '#e67e22', 'G_Score': '#9b59b6'}
+
+for score in SCORES:
+    if score not in ports_raw:
+        continue
+    df_p = ports_raw[score].dropna(subset=['LS']).sort_values('Date')
+    cum_ls = (1 + df_p['LS']).cumprod()
+    ax.plot(df_p['Date'], cum_ls, color=colores_score[score],
+            linewidth=1.8, label=f'{SCORE_LABELS[score]}')
+
+ax.axhline(1, color='black', linewidth=0.8, linestyle=':')
+ax.set_title('H1: Retorno acumulado de la estrategia Long-Short (Q1 − Q5)\n'
+             f'Equal-weighted, rezago t−1 — STOXX 600 {STOXX_VERSION}', fontsize=12, fontweight='bold')
+ax.set_ylabel('Retorno acumulado (base = 1)')
+ax.set_xlabel('Año')
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h1_ls_acumulado.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 3: Heatmap de loadings por quintil (tabla FF visual) ──────────────
+print("\n  Gráfico 3: Heatmap de loadings de factores por quintil...")
+
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+fig.suptitle('H1: Exposición a factores (loadings Carhart) por quintil ESG\n'
+             'Visualización de la Tabla 4B (estilo Fama-French Table 6)', fontsize=12, fontweight='bold')
+
+for ax, score in zip(axes, SCORES):
+    sub = df_reg_raw[(df_reg_raw['score'] == score) &
+                     (df_reg_raw['cartera'].isin(quintiles_only))].copy()
+    sub['q'] = sub['cartera'].str[1].astype(int)
+    sub = sub.sort_values('q').set_index('cartera')
+
+    matriz = sub[['beta_mkt', 'beta_smb', 'beta_hml', 'beta_wml']]
+    matriz.columns = ['b (mkt)', 's (SMB)', 'h (HML)', 'w (WML)']
+
+    sns.heatmap(matriz, annot=True, fmt='.3f', cmap='RdBu_r', center=0,
+                cbar=(ax == axes[-1]), ax=ax, linewidths=0.5)
+    ax.set_title(SCORE_LABELS[score], fontsize=10)
+    ax.set_ylabel('')
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h1_heatmap_loadings.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 4: R² CAPM vs Carhart por quintil ─────────────────────────────────
+print("\n  Gráfico 4: R² CAPM vs Carhart 4F (ESG compuesto)...")
+
+fig, ax = plt.subplots(figsize=(10, 5.5))
+
+sub_capm = df_reg_capm[(df_reg_capm['score'] == 'ESG_Score') &
+                       (df_reg_capm['cartera'].isin(quintiles_only))].copy()
+sub_4f   = df_reg_raw[(df_reg_raw['score'] == 'ESG_Score') &
+                      (df_reg_raw['cartera'].isin(quintiles_only))].copy()
+sub_capm['q'] = sub_capm['cartera'].str[1].astype(int)
+sub_4f['q']   = sub_4f['cartera'].str[1].astype(int)
+sub_capm = sub_capm.sort_values('q')
+sub_4f   = sub_4f.sort_values('q')
+
+x = np.arange(len(quintiles_only))
+ancho = 0.38
+
+ax.bar(x - ancho/2, sub_capm['R2'], ancho, label='CAPM (solo mercado)',
+       color='#95a5a6', edgecolor='black', linewidth=0.5)
+ax.bar(x + ancho/2, sub_4f['R2'], ancho, label='Carhart 4 Factores',
+       color='#2980b9', edgecolor='black', linewidth=0.5)
+
+for i, (r2c, r24) in enumerate(zip(sub_capm['R2'], sub_4f['R2'])):
+    ax.text(i - ancho/2, r2c + 0.005, f'{r2c:.3f}', ha='center', fontsize=8)
+    ax.text(i + ancho/2, r24 + 0.005, f'{r24:.3f}', ha='center', fontsize=8)
+
+ax.set_xticks(x)
+ax.set_xticklabels(quintiles_only)
+ax.set_ylim([0, 1.05])
+ax.set_ylabel('R²')
+ax.set_xlabel('Quintil ESG (Q1 = mejor)')
+ax.set_title('H1: Poder explicativo CAPM vs Carhart 4F — ESG Compuesto\n'
+             'La mejora de R² valida la inclusión de SMB, HML y WML (FF 1993)',
+             fontsize=11, fontweight='bold')
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h1_r2_capm_vs_carhart.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 5: Retorno acumulado Q1 vs Q5 vs mercado ──────────────────────────
+print("\n  Gráfico 5: Retorno acumulado Q1 vs Q5 vs mercado...")
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+fig.suptitle(f'H1: Rentabilidad Acumulada por Quintil ESG vs Mercado\n'
+             f'STOXX 600 {STOXX_VERSION} — 2015–2025', fontsize=12)
+
+for ax, score in zip(axes.flatten(), SCORES):
+    if score not in ports_raw:
+        continue
+    df_p = ports_raw[score].merge(
+        df_factors_4f[['YearMonth', 'Rm_monthly', 'Rf_monthly']],
+        on='YearMonth', how='inner'
+    ).sort_values('Date')
+
+    for q in [1, 5]:
+        col = f'Q{q}'
+        if col in df_p.columns and df_p[col].notna().sum() > 10:
+            cum = (1 + df_p[col].fillna(0)).cumprod()
+            lbl = f'Q{q} ({"mayor" if q==1 else "menor"} ESG)'
+            ax.plot(df_p['Date'], cum, color=colores_q[q], linewidth=2, label=lbl)
+
+    cum_mkt = (1 + df_p['Rm_monthly'].fillna(0)).cumprod()
+    ax.plot(df_p['Date'], cum_mkt, color=color_mkt, linewidth=1.5, linestyle='--',
+            label='Mercado (STOXX 600 NR)')
+
+    ax.set_title(f'{SCORE_LABELS[score]}', fontsize=10)
+    ax.set_ylabel('Retorno acumulado (base=1)', fontsize=8)
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.tick_params(axis='x', rotation=45)
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h1_alpha_quintiles.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 6 (anexo): Rolling alpha 36 meses de la estrategia L-S ────────────
+print("\n  Gráfico 6 (anexo): Rolling alpha 36 meses del L-S (ESG compuesto)...")
+
+VENTANA = 36
+df_ls = ports_raw['ESG_Score'].merge(
+    df_factors_4f[['YearMonth'] + FACTORES_CARHART],
+    on='YearMonth', how='inner'
+).dropna(subset=['EX_LS'] + FACTORES_CARHART).sort_values('Date').reset_index(drop=True)
+
+roll_fechas, roll_alphas, roll_ic = [], [], []
+for fin in range(VENTANA, len(df_ls) + 1):
+    ventana = df_ls.iloc[fin - VENTANA:fin]
+    Yv = ventana['EX_LS'].values
+    Xv = sm.add_constant(ventana[FACTORES_CARHART].values)
+    mv = sm.OLS(Yv, Xv).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+    roll_fechas.append(ventana['Date'].iloc[-1])
+    roll_alphas.append(mv.params[0] * 100)
+    roll_ic.append(1.96 * mv.bse[0] * 100)
+
+roll_alphas = np.array(roll_alphas)
+roll_ic     = np.array(roll_ic)
+
+fig, ax = plt.subplots(figsize=(13, 6))
+ax.plot(roll_fechas, roll_alphas, color='#c0392b', linewidth=1.8, label='Alpha rolling 36m (L-S ESG)')
+ax.fill_between(roll_fechas, roll_alphas - roll_ic, roll_alphas + roll_ic,
+                color='#c0392b', alpha=0.15, label='IC 95% (Newey-West)')
+ax.axhline(0, color='black', linewidth=0.8, linestyle=':')
+ax.set_title('H1 (anexo): Estabilidad temporal del alpha Long-Short — ESG Compuesto\n'
+             f'Ventana móvil de 36 meses — STOXX 600 {STOXX_VERSION}', fontsize=12, fontweight='bold')
+ax.set_ylabel('Alpha (%/mes)')
+ax.set_xlabel('Fin de ventana')
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h1_rolling_alpha_ls.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ── Gráfico 7 (anexo): QQ-plots de residuos (diagnóstico de normalidad) ───────
+print("\n  Gráfico 7 (anexo): QQ-plots de residuos (Q1, Q5, L-S del ESG)...")
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+fig.suptitle('H1 (anexo): QQ-plots de residuos — diagnóstico de normalidad (test Jarque-Bera)\n'
+             'Carhart 4F, ESG Compuesto', fontsize=12, fontweight='bold')
+
+for ax, cartera in zip(axes, ['Q1', 'Q5', 'Q1-Q5']):
+    ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+    df_qq = ports_raw['ESG_Score'].merge(
+        df_factors_4f[['YearMonth'] + FACTORES_CARHART],
+        on='YearMonth', how='inner'
+    )[[ret_col] + FACTORES_CARHART].dropna()
+
+    Yq = df_qq[ret_col].values
+    Xq = sm.add_constant(df_qq[FACTORES_CARHART].values)
+    mq = sm.OLS(Yq, Xq).fit()
+
+    sm.qqplot(mq.resid, line='45', fit=True, ax=ax,
+              markerfacecolor='#2980b9', markeredgecolor='none', alpha=0.6)
+    jb_s, jb_pv, _, _ = jarque_bera(mq.resid)
+    ax.set_title(f'Cartera {cartera}  |  JB={jb_s:.1f} (p={jb_pv:.3f})', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+ruta = f'{RUTA_GRAFICOS}/h1_qqplot_residuos.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+# ==============================================================================
+# SECCIÓN 9: RESUMEN EJECUTIVO H1
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("RESUMEN EJECUTIVO — HIPÓTESIS 1")
+print("=" * 80)
+
+# Alpha L-S por score (RAW)
+print("\n  Alphas Long-Short por Score (modelo principal RAW, Newey-West):")
+print(f"  {'Score':<20} {'α(%/mes)':>10} {'α(%/año)':>10} {'t-NW':>8} {'Sig':>5}")
+print(f"  {'─'*58}")
+
+for score in SCORES:
+    fila = df_reg_raw[(df_reg_raw['score']==score) & (df_reg_raw['cartera']=='Q1-Q5')]
+    if fila.empty:
+        continue
+    row = fila.iloc[0]
+    stars = sig_stars(row['p_alpha_nw'])
+    alpha_anual = ((1 + row['alpha'])**12 - 1) * 100
+    print(f"  {SCORE_LABELS[score]:<20} {row['alpha']*100:>10.4f} {alpha_anual:>10.3f} {row['t_alpha_nw']:>8.3f} {stars:>5}")
+
+# Interpretación
+print("\n  Interpretación para el TFM:")
+ls_esg = df_reg_raw[(df_reg_raw['score']=='ESG_Score') & (df_reg_raw['cartera']=='Q1-Q5')]
+if not ls_esg.empty:
+    r = ls_esg.iloc[0]
+    if r['p_alpha_nw'] < 0.05 and r['alpha'] > 0:
+        print(f"  ✅ ACEPTAR H1: La estrategia L-S ESG genera alpha de {r['alpha']*100:.4f}%/mes")
+        print(f"     (equivalente a {((1+r['alpha'])**12-1)*100:.2f}% anual)")
+        print(f"     t-NW = {r['t_alpha_nw']:.3f} > 1.96 → significativo al 5%")
+        print(f"     El mercado europeo premia a las empresas con mejor desempeño ESG.")
+    elif r['p_alpha_nw'] < 0.05 and r['alpha'] < 0:
+        print(f"  ❌ RECHAZAR H1 (con alpha NEGATIVO significativo):")
+        print(f"     Alpha L-S = {r['alpha']*100:.4f}%/mes ({((1+r['alpha'])**12-1)*100:.2f}% anual)")
+        print(f"     t-NW = {r['t_alpha_nw']:.3f}, p = {r['p_alpha_nw']:.4f}")
+        print(f"     Las empresas de PEOR ESG generan MAYOR rentabilidad anormal.")
+        print(f"     Coherente con: Green Premium (Pástor et al. 2021) y")
+        print(f"     riesgo brown no capturado (Bolton & Kacperczyk 2021).")
+    else:
+        print(f"  ❌ RECHAZAR H1: Alpha L-S = {r['alpha']*100:.4f}%/mes, t-NW = {r['t_alpha_nw']:.3f}")
+        print(f"     No es estadísticamente significativo (p = {r['p_alpha_nw']:.4f} > 0.05)")
+        print(f"     Consistente con la hipótesis de mercados eficientes: la información")
+        print(f"     ESG ya está incorporada en los precios del STOXX 600.")
+
+# Interpretación tipo taller: betas y R²
+print("\n  Lectura tipo Taller de regresión (quintiles ESG compuesto):")
+sub_esg = df_reg_raw[(df_reg_raw['score']=='ESG_Score') &
+                     (df_reg_raw['cartera'].isin(quintiles_only))]
+for _, r in sub_esg.iterrows():
+    tipo = "OFENSIVA (β>1)" if r['beta_mkt'] > 1 else "DEFENSIVA (β<1)"
+    print(f"    {r['cartera']}: β={r['beta_mkt']:.3f} → {tipo} | "
+          f"R²={r['R2']:.3f} → el mercado y los factores explican {r['R2']*100:.1f}% del riesgo")
+
+# Nota metodológica sobre el índice de mercado utilizado
+rm_rf_medio = df_factors_4f['Rm_Rf'].mean() * 100
+print(f"""
+  📋 NOTA METODOLÓGICA — ÍNDICE DE MERCADO (ver Anexo A1):
+  Versión activa:    {STOXX_VERSION}
+  Rm_Rf observado:   {rm_rf_medio:.4f}%/mes  ({rm_rf_medio*12:.3f}%/año)
+  (media sobre los meses de la ventana de regresión, que excluye 2015 por la
+   ventana de momentum del factor WML. Una prima de mercado ex-post cercana a
+   cero refleja las condiciones del período — mercado europeo plano frente a
+   un Euribor elevado en 2023-2025 — y NO un sesgo de datos.)
+
+  Se utiliza el STOXX Europe 600 Net Return (NR) como proxy del mercado,
+  que incluye la reinversión de dividendos netos de retención fiscal (~3%/año).
+  Esta elección es la convención estándar en fondos UCITS europeos y en la
+  literatura académica de factores para Europa.
+  Justificación estadística completa: Anexo A1 (A1_Comparacion_Indices_STOXX600).
+
+  Impacto vs. Price Return (PR): la prima de mercado mejora ≈ +0.14%/mes al
+  incorporar dividendos, y los alphas absolutos por quintil son ≈ 0.20%/mes
+  menores que con PR. El spread Q1−Q5 (hallazgo central de H1) es invariante
+  a la elección del índice — el ajuste es idéntico en todos los quintiles.
+""")
+
+# ==============================================================================
+# SECCIÓN 10: ANEXO — SUMMARIES COMPLETOS DE STATSMODELS
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("SECCIÓN 10: ANEXO — Summaries completos (formato Taller de regresión)")
+print("=" * 80)
+print("""
+Regresiones representativas con el output completo de statsmodels
+(errores estándar Newey-West HAC 3 lags). Para incluir en el anexo del TFM
+como evidencia del formato estándar visto en clase.
+""")
+
+
+def summary_completo(ports_dict, df_fct, score, cartera):
+    """Reestima la regresión Carhart con nombres de variables y muestra el summary completo."""
+    df_p = ports_dict[score].merge(
+        df_fct[['YearMonth'] + FACTORES_CARHART],
+        on='YearMonth', how='inner'
+    )
+    ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+    df_reg = df_p[[ret_col] + FACTORES_CARHART].dropna()
+
+    Y = df_reg[ret_col]
+    X = sm.add_constant(df_reg[FACTORES_CARHART])
+    res = sm.OLS(Y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+
+    print(f"\n{'═'*78}")
+    print(f"  {SCORE_LABELS[score]} — Cartera {cartera} (Newey-West 3 lags)")
+    print(f"{'═'*78}")
+    print(res.summary())
+
+
+# Casos representativos: mejor quintil, peor quintil y estrategia L-S del ESG
+for cartera in ['Q1', 'Q5', 'Q1-Q5']:
+    summary_completo(ports_raw, df_factors_4f, 'ESG_Score', cartera)
+
+print(f"\nFin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)

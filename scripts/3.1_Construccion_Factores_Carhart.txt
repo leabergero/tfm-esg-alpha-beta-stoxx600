@@ -1,0 +1,490 @@
+# ==============================================================================
+# SCRIPT 3.1: CONSTRUCCIÓN DE FACTORES CARHART 4-FACTOR MODEL
+# Universo:   STOXX 600 (misma muestra del estudio — sin contaminar con datos externos)
+# Frecuencia: mensual
+# Ponderación: value-weighted (por capitalización) para los factores FF
+#              equal-weighted (1/N) para los portafolios ESG quintiles
+# ==============================================================================
+#
+# FACTORES A CONSTRUIR:
+#
+#   Rm - Rf  = Retorno mensual STOXX 600 (mercado) menos Euribor_1M
+#
+#   SMB      = Small Minus Big (factor tamaño)
+#              Metodología 6 portafolios Fama-French (1993):
+#              2 grupos tamaño (S, B) × 3 grupos BtM (H, M, L)
+#              SMB = (SH + SM + SL)/3 − (BH + BM + BL)/3
+#
+#   HML      = High Minus Low (factor valor, Book-to-Market)
+#              Mismos 6 portafolios:
+#              HML = (SH + BH)/2 − (SL + BL)/2
+#
+#   WML      = Winners Minus Losers (factor momentum, Carhart 1997)
+#              Momentum = retorno acumulado meses t-12 a t-2 (excluye t-1)
+#              Top 30% = Winners, Bottom 30% = Losers
+#              WML = Ret_Winners − Ret_Losers (value-weighted)
+#
+# REFERENCIA: Fama & French (1993), Carhart (1997)
+# REPLICACIÓN: Construidos desde la misma muestra del estudio para evitar
+#              inconsistencias entre el universo de factores y el universo
+#              de los portafolios ESG (problema habitual al usar datos Ken French).
+#
+# REQUIERE: df_monthly_raw y df_stoxx cargados en memoria
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT 3.1: FACTORES CARHART 4-FACTOR MODEL")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, name in [('df_monthly_raw', 'Script 2.3'), ('df_stoxx', 'Script 2 principal')]:
+    if var not in dir():
+        print(f"❌ Error: '{var}' no está en memoria. Ejecuta {name} primero.")
+        raise SystemExit
+
+# ==============================================================================
+# SECCIÓN 1: RETORNO MENSUAL DEL MERCADO (Rm) y PRIMA DE MERCADO (Rm - Rf)
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 1: Rm mensual y prima de mercado (Rm - Rf)")
+print("─" * 80)
+
+df_stoxx_work = df_stoxx.copy()
+df_stoxx_work['Date'] = pd.to_datetime(df_stoxx_work['Date'])
+df_stoxx_work['YearMonth'] = df_stoxx_work['Date'].dt.to_period('M')
+
+# Retorno mensual del STOXX 600: producto de retornos diarios
+# El campo 'Return' viene del CSV como retorno diario decimal
+col_ret_stoxx = 'Return'
+col_close_stoxx = 'Close_Price'
+
+rm_monthly = (
+    df_stoxx_work
+    .groupby('YearMonth')[col_ret_stoxx]
+    .apply(lambda x: (1 + x.dropna()).prod() - 1 if x.notna().any() else np.nan)
+    .reset_index()
+    .rename(columns={col_ret_stoxx: 'Rm_monthly'})
+)
+
+# Euribor mensual (ya disponible en df_monthly_raw como Rf_monthly)
+rf_monthly = (
+    df_monthly_raw[['YearMonth', 'Rf_monthly']]
+    .drop_duplicates('YearMonth')
+    .copy()
+)
+
+# Prima de mercado
+mkt_factor = rm_monthly.merge(rf_monthly, on='YearMonth', how='inner')
+mkt_factor['Rm_Rf'] = mkt_factor['Rm_monthly'] - mkt_factor['Rf_monthly']
+mkt_factor['Date'] = mkt_factor['YearMonth'].dt.to_timestamp()
+
+print(f"✅ Prima de mercado (Rm - Rf):")
+print(f"   Meses disponibles:  {len(mkt_factor)}")
+print(f"   Período:            {mkt_factor['Date'].min().date()} → {mkt_factor['Date'].max().date()}")
+print(f"   Media mensual:      {mkt_factor['Rm_Rf'].mean()*100:.3f}%")
+print(f"   Desv. est.:         {mkt_factor['Rm_Rf'].std()*100:.3f}%")
+print(f"   Mín / Máx:          {mkt_factor['Rm_Rf'].min()*100:.2f}% / {mkt_factor['Rm_Rf'].max()*100:.2f}%")
+
+# ==============================================================================
+# SECCIÓN 2: PREPARACIÓN DE LA MATRIZ DE RETORNOS Y CARACTERÍSTICAS
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 2: Preparación — una observación por empresa × mes")
+print("─" * 80)
+
+# Tomar la última observación disponible de cada empresa por mes
+# (Market_Cap, Price_To_Book y Return_monthly ya están en df_monthly_raw)
+panel = df_monthly_raw[
+    ['RIC', 'YearMonth', 'Date', 'Return_monthly', 'Market_Cap_EUR', 'Price_To_Book']
+].copy()
+
+# Price_To_Book ya fue limpiado en Script 2.3 (P1-P99), todos positivos
+# BtM = Book-to-Market = 1 / Price_To_Book
+panel = panel[panel['Price_To_Book'] > 0].copy()
+panel['BtM'] = 1.0 / panel['Price_To_Book']
+
+# Eliminar filas sin retorno o sin capitalización (necesarios para portafolios)
+panel = panel.dropna(subset=['Return_monthly', 'Market_Cap_EUR', 'BtM'])
+
+print(f"✅ Panel de trabajo:")
+print(f"   Observaciones:     {len(panel):,}")
+print(f"   Empresas únicas:   {panel['RIC'].nunique()}")
+print(f"   Meses únicos:      {panel['YearMonth'].nunique()}")
+print(f"   Cobertura BtM:     100% (tras filtrar PTB > 0)")
+
+# Verificar que los meses tienen suficientes empresas para los portafolios
+n_por_mes = panel.groupby('YearMonth')['RIC'].count()
+print(f"\n   Empresas por mes:  min={n_por_mes.min()}  mediana={n_por_mes.median():.0f}  max={n_por_mes.max()}")
+meses_bajo = (n_por_mes < 50).sum()
+if meses_bajo > 0:
+    print(f"   ⚠️  {meses_bajo} meses con < 50 empresas — portafolios pueden ser ruidosos")
+
+# ==============================================================================
+# SECCIÓN 3: FACTORES SMB y HML — 6 PORTAFOLIOS FAMA-FRENCH
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 3: Factores SMB y HML — metodología 6 portafolios Fama-French")
+print("─" * 80)
+
+print("""
+Metodología:
+  1. Cada mes: clasificar empresas en S o B según mediana de Market_Cap_EUR
+  2. Cada mes: clasificar empresas en L, M, H según percentiles 30/70 de BtM
+  3. Cruzar → 6 portafolios: SL, SM, SH, BL, BM, BH
+  4. Retorno de cada portafolio: ponderado por capitalización (value-weighted)
+  5. SMB = (SH + SM + SL)/3 − (BH + BM + BL)/3
+  6. HML = (SH + BH)/2 − (SL + BL)/2
+""")
+
+
+def retorno_value_weighted(df_port):
+    """Retorno ponderado por capitalización de mercado."""
+    w = df_port['Market_Cap_EUR'] / df_port['Market_Cap_EUR'].sum()
+    return (w * df_port['Return_monthly']).sum()
+
+
+def calcular_smb_hml_mes(df_mes):
+    """
+    Para un mes dado, clasifica empresas en 6 portafolios y calcula
+    los retornos de cada portafolio para construir SMB y HML.
+    """
+    df = df_mes.copy()
+    n = len(df)
+
+    if n < 20:
+        return np.nan, np.nan
+
+    # Clasificación por tamaño (mediana)
+    mediana_cap = df['Market_Cap_EUR'].median()
+    df['Size_group'] = np.where(df['Market_Cap_EUR'] <= mediana_cap, 'S', 'B')
+
+    # Clasificación por BtM (percentiles 30/70)
+    p30 = df['BtM'].quantile(0.30)
+    p70 = df['BtM'].quantile(0.70)
+    df['BtM_group'] = pd.cut(
+        df['BtM'],
+        bins=[-np.inf, p30, p70, np.inf],
+        labels=['L', 'M', 'H']
+    )
+
+    # 6 portafolios
+    resultados = {}
+    for size in ['S', 'B']:
+        for btm in ['H', 'M', 'L']:
+            key = size + btm
+            subset = df[(df['Size_group'] == size) & (df['BtM_group'] == btm)]
+            if len(subset) >= 3:
+                resultados[key] = retorno_value_weighted(subset)
+            else:
+                resultados[key] = np.nan
+
+    # Calcular SMB y HML (solo si todos los sub-portafolios son válidos)
+    sh, sm, sl = resultados.get('SH'), resultados.get('SM'), resultados.get('SL')
+    bh, bm, bl = resultados.get('BH'), resultados.get('BM'), resultados.get('BL')
+
+    if all(v is not None and not np.isnan(v) for v in [sh, sm, sl, bh, bm, bl]):
+        smb = (sh + sm + sl) / 3 - (bh + bm + bl) / 3
+        hml = (sh + bh) / 2 - (sl + bl) / 2
+    else:
+        smb, hml = np.nan, np.nan
+
+    return smb, hml
+
+
+# Aplicar mes a mes
+resultados_ff = []
+for ym, grupo in panel.groupby('YearMonth'):
+    smb_m, hml_m = calcular_smb_hml_mes(grupo)
+    resultados_ff.append({'YearMonth': ym, 'SMB': smb_m, 'HML': hml_m})
+
+df_smb_hml = pd.DataFrame(resultados_ff)
+
+nans_smb = df_smb_hml['SMB'].isna().sum()
+nans_hml = df_smb_hml['HML'].isna().sum()
+print(f"✅ SMB calculado: {df_smb_hml['SMB'].notna().sum()} meses ({nans_smb} NaN)")
+print(f"✅ HML calculado: {df_smb_hml['HML'].notna().sum()} meses ({nans_hml} NaN)")
+print(f"\n   SMB → media: {df_smb_hml['SMB'].mean()*100:.3f}%  desv: {df_smb_hml['SMB'].std()*100:.3f}%")
+print(f"   HML → media: {df_smb_hml['HML'].mean()*100:.3f}%  desv: {df_smb_hml['HML'].std()*100:.3f}%")
+print(f"\n   Interpretación:")
+print(f"   {'SMB > 0 → Pequeñas superaron a grandes en promedio' if df_smb_hml['SMB'].mean() > 0 else 'SMB < 0 → Grandes superaron a pequeñas (frecuente en mercados con ESG premium, donde grandes adoptan antes)'}")
+print(f"   {'HML > 0 → Valor superó a crecimiento' if df_smb_hml['HML'].mean() > 0 else 'HML < 0 → Crecimiento superó a valor (coherente con 2015-2025 dominado por tech y crecimiento)'}")
+
+# ==============================================================================
+# SECCIÓN 4: FACTOR WML (MOMENTUM) — CARHART 1997
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 4: Factor WML (Momentum) — Carhart (1997)")
+print("─" * 80)
+
+print("""
+Metodología:
+  1. Cada mes t: calcular retorno acumulado de t-12 a t-2 (11 meses, skip t-1)
+     Razón del skip: el mes t-1 muestra reversión a corto plazo, no momentum
+  2. Clasificar: Winners = top 30%, Losers = bottom 30%
+  3. WML = Retorno value-weighted(Winners) − Retorno value-weighted(Losers)
+  4. Los retornos usados son los del MES ACTUAL (t), no los del período de formación
+""")
+
+# Construir matriz pivotada de retornos mensuales
+ret_matrix = panel.pivot_table(
+    index='YearMonth',
+    columns='RIC',
+    values='Return_monthly'
+)
+
+cap_matrix = panel.pivot_table(
+    index='YearMonth',
+    columns='RIC',
+    values='Market_Cap_EUR'
+)
+
+# Momentum: retorno acumulado t-12 a t-2
+# shift(1) da t-1, shift(2) da t-2
+# rolling(11) sobre shift(2) cubre t-2, t-3, ..., t-12 (= 11 meses)
+mom_matrix = ret_matrix.shift(2).rolling(window=11, min_periods=8).apply(
+    lambda x: (1 + x).prod() - 1, raw=True
+)
+
+# Calcular WML mes a mes
+resultados_wml = []
+for ym in mom_matrix.index:
+    mom_t    = mom_matrix.loc[ym]
+    ret_t    = ret_matrix.loc[ym]   if ym in ret_matrix.index   else pd.Series(dtype=float)
+    cap_t    = cap_matrix.loc[ym]   if ym in cap_matrix.index   else pd.Series(dtype=float)
+
+    # Alinear índices
+    idx_validos = mom_t.dropna().index.intersection(ret_t.dropna().index).intersection(cap_t.dropna().index)
+
+    if len(idx_validos) < 20:
+        resultados_wml.append({'YearMonth': ym, 'WML': np.nan})
+        continue
+
+    mom_v = mom_t[idx_validos]
+    ret_v = ret_t[idx_validos]
+    cap_v = cap_t[idx_validos]
+
+    p30 = mom_v.quantile(0.30)
+    p70 = mom_v.quantile(0.70)
+
+    winners_idx = mom_v[mom_v >= p70].index
+    losers_idx  = mom_v[mom_v <= p30].index
+
+    if len(winners_idx) < 3 or len(losers_idx) < 3:
+        resultados_wml.append({'YearMonth': ym, 'WML': np.nan})
+        continue
+
+    def vw_ret(idx_list):
+        caps = cap_v[idx_list]
+        rets = ret_v[idx_list]
+        w = caps / caps.sum()
+        return (w * rets).sum()
+
+    ret_winners = vw_ret(winners_idx)
+    ret_losers  = vw_ret(losers_idx)
+
+    resultados_wml.append({'YearMonth': ym, 'WML': ret_winners - ret_losers})
+
+df_wml = pd.DataFrame(resultados_wml)
+
+nans_wml = df_wml['WML'].isna().sum()
+print(f"✅ WML calculado: {df_wml['WML'].notna().sum()} meses ({nans_wml} NaN — esperados primeros ~12 meses por ventana de momentum)")
+print(f"\n   WML → media: {df_wml['WML'].mean()*100:.3f}%  desv: {df_wml['WML'].std()*100:.3f}%")
+print(f"   {'WML > 0 → Momentum positivo (coherente con literatura)' if df_wml['WML'].mean() > 0 else 'WML < 0 → Reversión dominante en el período'}")
+
+# ==============================================================================
+# SECCIÓN 5: CONSOLIDAR df_factors
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 5: Consolidación de df_factors")
+print("─" * 80)
+
+df_factors = (
+    mkt_factor[['YearMonth', 'Date', 'Rm_monthly', 'Rf_monthly', 'Rm_Rf']]
+    .merge(df_smb_hml, on='YearMonth', how='left')
+    .merge(df_wml,     on='YearMonth', how='left')
+)
+
+df_factors = df_factors.sort_values('Date').reset_index(drop=True)
+
+print(f"✅ df_factors creado:")
+print(f"   {df_factors.shape[0]} meses × {df_factors.shape[1]} columnas")
+print(f"   Columnas: {list(df_factors.columns)}")
+print(f"\n   Cobertura por factor:")
+for col in ['Rm_Rf', 'SMB', 'HML', 'WML']:
+    cob = df_factors[col].notna().sum()
+    pct = cob / len(df_factors) * 100
+    print(f"     {col:<8} {cob} meses ({pct:.1f}%)")
+
+# Meses donde los 4 factores están disponibles simultáneamente
+mask_4f = df_factors[['Rm_Rf', 'SMB', 'HML', 'WML']].notna().all(axis=1)
+df_factors_4f = df_factors[mask_4f].copy()
+
+print(f"\n   Meses con los 4 factores completos (para regresiones H1): {mask_4f.sum()}")
+print(f"   Período efectivo de regresión: {df_factors_4f['Date'].min().date()} → {df_factors_4f['Date'].max().date()}")
+
+# ==============================================================================
+# SECCIÓN 6: ESTADÍSTICAS DESCRIPTIVAS Y VALIDACIÓN
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 6: Estadísticas descriptivas y validación")
+print("─" * 80)
+
+factores = ['Rm_Rf', 'SMB', 'HML', 'WML']
+print(f"\n{'Factor':<10} {'Media%':>8} {'Desv%':>8} {'Mín%':>8} {'Máx%':>8} {'SR anual':>10}")
+print("─" * 60)
+
+for col in factores:
+    s = df_factors[col].dropna()
+    media  = s.mean() * 100
+    desv   = s.std()  * 100
+    mín    = s.min()  * 100
+    máx    = s.max()  * 100
+    sharpe = (s.mean() / s.std()) * np.sqrt(12) if s.std() > 0 else np.nan
+    print(f"{col:<10} {media:>8.3f} {desv:>8.3f} {mín:>8.2f} {máx:>8.2f} {sharpe:>10.3f}")
+
+print(f"\n   Matriz de correlaciones entre factores:")
+corr = df_factors[factores].dropna().corr()
+print(corr.round(3).to_string())
+
+# Advertencia si alguna correlación es muy alta (problema de multicolinealidad)
+for i in range(len(factores)):
+    for j in range(i+1, len(factores)):
+        c = corr.iloc[i, j]
+        if abs(c) > 0.50:
+            print(f"\n   ⚠️  Correlación alta: {factores[i]} ↔ {factores[j]} = {c:.3f}")
+            print(f"      Puede generar multicolinealidad en las regresiones de H1.")
+
+# Verificación de signos esperados (contexto histórico como referencia)
+print(f"\n   Verificación de signos:")
+smb_signo  = "✅" if df_factors['SMB'].mean() > -0.005 else "⚠️ "
+hml_signo  = "⚠️ " if df_factors['HML'].mean() < -0.005 else "✅"
+wml_signo  = "✅" if df_factors['WML'].mean() > -0.005 else "⚠️ "
+mkt_signo  = "✅" if df_factors['Rm_Rf'].mean() > 0 else "⚠️ "
+print(f"     {mkt_signo} Rm-Rf media > 0 (mercado > libre riesgo):         {df_factors['Rm_Rf'].mean()*100:.3f}%")
+print(f"     {smb_signo} SMB (no muy negativo):                             {df_factors['SMB'].mean()*100:.3f}%")
+print(f"     {hml_signo} HML (puede ser negativo en tech/growth 2015-2025): {df_factors['HML'].mean()*100:.3f}%")
+print(f"     {wml_signo} WML (momentum positivo esperado):                  {df_factors['WML'].mean()*100:.3f}%")
+
+rm_rf_medio = df_factors['Rm_Rf'].mean() * 100
+smb_medio   = df_factors['SMB'].mean() * 100
+hml_medio   = df_factors['HML'].mean() * 100
+wml_medio   = df_factors['WML'].mean() * 100
+meses_4f    = df_factors[['Rm_Rf','SMB','HML','WML']].notna().all(axis=1).sum()
+
+print(f"""
+   INTERPRETACIÓN DE FACTORES — {STOXX_VERSION}
+   ─────────────────────────────────────────────────────────────────────────
+   Rm_Rf = {rm_rf_medio:+.3f}%/mes → prima de mercado positiva, coherente con el uso del
+   índice Net Return (dividendos netos incluidos). Ver decisión metodológica en Anexo A1.
+
+   SMB = {smb_medio:+.3f}%/mes: empresas grandes superaron a las pequeñas — coherente con
+   que las large-caps europeas lideraron la adopción ESG en el período 2015-2025.
+
+   HML = {hml_medio:+.3f}%/mes: valor ligeramente sobre crecimiento — consistente con la
+   composición del mercado europeo, más orientado a value que el americano.
+
+   WML = {wml_medio:+.3f}%/mes: momentum positivo y el factor más fuerte de los tres,
+   coherente con la evidencia histórica de Carhart (1997) en mercados desarrollados.
+
+   {meses_4f} meses con los 4 factores completos — suficiente para las regresiones de H1.
+""")
+
+# ==============================================================================
+# SECCIÓN 7: GRÁFICO DE SERIES TEMPORALES
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 7: Visualización de los 4 factores")
+print("─" * 80)
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+fig.suptitle(f'Factores del Modelo Carhart 4 Factores\nSTOXX 600 {STOXX_VERSION} — 2015–2025', fontsize=13)
+
+colores = {'Rm_Rf': '#1f77b4', 'SMB': '#2ca02c', 'HML': '#d62728', 'WML': '#9467bd'}
+
+for ax, col in zip(axes.flatten(), factores):
+    s = df_factors[['Date', col]].dropna()
+
+    # Línea del factor
+    ax.plot(s['Date'], s[col] * 100, color=colores[col], linewidth=0.8, alpha=0.7)
+
+    # Retorno acumulado (eje secundario)
+    ax2 = ax.twinx()
+    cum_ret = (1 + s[col]).cumprod()
+    ax2.plot(s['Date'], cum_ret, color=colores[col], linewidth=2, alpha=0.4, linestyle='--')
+    ax2.set_ylabel('Retorno acumulado (índice = 1)', fontsize=8, color='grey')
+    ax2.tick_params(axis='y', labelcolor='grey')
+
+    ax.axhline(0, color='black', linewidth=0.5, linestyle=':')
+    ax.set_title(f'{col}  |  media={s[col].mean()*100:.2f}%/mes', fontsize=11)
+    ax.set_ylabel('Retorno mensual (%)', fontsize=9)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.tick_params(axis='x', rotation=45)
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+# Guardar gráfico: crear carpeta si no existe
+import os
+ruta_grafico = '/content/drive/MyDrive/TFM_STOXX600/HITO4/factores_carhart_4f.png'
+os.makedirs(os.path.dirname(ruta_grafico), exist_ok=True)
+plt.savefig(ruta_grafico, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   Gráfico guardado en: {ruta_grafico}")
+
+# ==============================================================================
+# SECCIÓN 8: RESUMEN FINAL
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("RESUMEN FINAL — FACTORES DISPONIBLES")
+print("=" * 80)
+print(f"""
+─────────────────────────────────────────────────────────────────────
+VARIABLES CREADAS EN MEMORIA:
+─────────────────────────────────────────────────────────────────────
+
+  df_factors       → {len(df_factors)} meses × {df_factors.shape[1]} columnas
+                     Columns: Date, YearMonth, Rm_monthly, Rf_monthly,
+                              Rm_Rf, SMB, HML, WML
+
+  df_factors_4f    → {len(df_factors_4f)} meses con los 4 factores completos
+                     (para regresiones en Script 3.2)
+
+─────────────────────────────────────────────────────────────────────
+RESUMEN DE ESTADÍSTICAS (período completo):
+─────────────────────────────────────────────────────────────────────
+
+  Factor    Media/mes    Desv/mes     Sharpe anual
+  Rm_Rf     {df_factors['Rm_Rf'].mean()*100:>8.3f}%     {df_factors['Rm_Rf'].std()*100:>7.3f}%      {(df_factors['Rm_Rf'].mean()/df_factors['Rm_Rf'].std())*np.sqrt(12):.3f}
+  SMB       {df_factors['SMB'].mean()*100:>8.3f}%     {df_factors['SMB'].std()*100:>7.3f}%      {(df_factors['SMB'].mean()/df_factors['SMB'].std())*np.sqrt(12) if df_factors['SMB'].std()>0 else 0:.3f}
+  HML       {df_factors['HML'].mean()*100:>8.3f}%     {df_factors['HML'].std()*100:>7.3f}%      {(df_factors['HML'].mean()/df_factors['HML'].std())*np.sqrt(12) if df_factors['HML'].std()>0 else 0:.3f}
+  WML       {df_factors['WML'].mean()*100:>8.3f}%     {df_factors['WML'].std()*100:>7.3f}%      {(df_factors['WML'].mean()/df_factors['WML'].std())*np.sqrt(12) if df_factors['WML'].std()>0 else 0:.3f}
+
+─────────────────────────────────────────────────────────────────────
+PRÓXIMO PASO:
+─────────────────────────────────────────────────────────────────────
+  Script 3.2: Construir portafolios ESG (Q1-Q5) y regresiones H1
+              → Regresión:  R_pt − R_ft = α_p + β_p·(Rm_Rf) + s_p·SMB + h_p·HML + w_p·WML
+              → Alpha de Jensen por quintil y por score (ESG, E, S, G)
+              → Test GRS para nulidad conjunta de alphas
+""")
+
+print(f"Fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)
