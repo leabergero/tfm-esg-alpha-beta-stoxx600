@@ -1,7 +1,7 @@
 # TFM: Impacto del Desempeño ESG en Alpha y Beta — STOXX 600
 
 **Autor:** Leandro R. Bergero  
-**Universidad:** BSM - UPF (Master en Finanzas)  
+**Universidad:** BSM - UPF (Msc Finance & Banking)  
 **Período:** 2015-2025  
 **Última actualización:** junio 2026
 
