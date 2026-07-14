@@ -4,10 +4,17 @@
 
 ### `TFM_Impacto_del_desempeño_ESG_en_la_Rentabilidad_y_el_Riesgo_de_las_empresas_del_STOXX_600_.ipynb`
 
-**Tamaño:** 3.2 MB (con outputs ejecutados)  
+**Tamaño:** 3.9 MB (con outputs ejecutados)  
 **Plataforma:** Google Colab (recomendado)  
 **Tiempo de ejecución:** ~25 minutos  
-**Última ejecución auditada:** 11 de junio de 2026  
+**Última ejecución auditada:** julio de 2026  
+
+**Novedad (julio 2026):** incluye al final las **pruebas de robustez de H3**
+(GARCH(1,1)-umbral, LSTAR y contraste estadístico entre modelos de régimen —
+scripts A2-A5), agregadas en respuesta a la observación del tribunal del Hito 4.
+
+También se incluye `TFM Impacto ... .ipynb - Colab.pdf`: la impresión en PDF del
+notebook completo ejecutado, para consulta sin necesidad de abrir Colab.
 
 ---
 

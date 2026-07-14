@@ -1,0 +1,486 @@
+# ==============================================================================
+# SCRIPT A4 — ROBUSTEZ H3: CONTRASTE ESTADÍSTICO ENTRE MODELOS DE RÉGIMEN
+# ==============================================================================
+#
+# OBJETIVO: obtener PRUEBA SUFICIENTE de si la elección del modelo de
+# calma/crisis (MS-CAPM del Script 3.4 vs GARCH-umbral de A2 vs LSTAR de A3)
+# afecta al resultado de la Hipótesis 3.
+#
+# BATERÍA DE CONTRASTES:
+#   1. Concordancia de clasificaciones: tablas de contingencia, kappa de
+#      Cohen, correlación de Spearman entre medidas de estrés, y calidad
+#      de la clasificación MS (RCM de Ang & Bekaert 2002).
+#   2. Tabla comparativa de δ (Δβ crisis−calma) por modelo × score × cartera
+#      + concordancia de la DECISIÓN cualitativa (refugio/amplifica/sin cambio).
+#   3. Test formal de igualdad de δ entre modelos: BOOTSTRAP PAREADO POR
+#      BLOQUES (moving block, mismos meses remuestreados para todos los
+#      modelos) → IC 95% y p-valor de (δ_alternativo − δ_MS).
+#   4. Bondad de ajuste comparada de la Etapa 2: AIC/BIC (misma Y, misma n).
+#   5. Sensibilidad del BALANCE: δ del hallazgo central (ESG Q5) al variar
+#      el corte de P(crisis) del MS y el cuantil del umbral GARCH
+#      → responde directamente a la crítica del tribunal.
+#   6. Veredicto automático con criterio de decisión pre-especificado.
+#
+# CRITERIO DE DECISIÓN (pre-especificado, documentar en el TFM):
+#   MANTENER el MS-CAPM como modelo principal si (i) la decisión cualitativa
+#   coincide en los 3 modelos para el hallazgo central, (ii) los IC bootstrap
+#   de (δ_alt − δ_MS) contienen el 0, y (iii) δ es estable ante el grado de
+#   balance (Sección 5). CAMBIAR de modelo si (i) falla, priorizando el
+#   modelo con mejor AIC/BIC.
+#
+# REQUIERE EN MEMORIA: Script 3.4 (resultados_h3, D_crisis, prob_crisis_mkt,
+#   rm_diario) + Script A2 (D_crisis_garch, sigma_m_garch, resultados_h3_garch)
+#   + Script A3 (G_lstar_m, D_crisis_lstar, s_lstar_m, resultados_h3_lstar)
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from scipy import stats
+import matplotlib.pyplot as plt
+from datetime import datetime
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT A4: H3 ROBUSTEZ — CONTRASTE ESTADÍSTICO ENTRE MODELOS DE RÉGIMEN")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, nombre in [('resultados_h3', 'Script 3.4'), ('D_crisis', 'Script 3.4'),
+                    ('prob_crisis_mkt', 'Script 3.4'),
+                    ('D_crisis_garch', 'Script A2'), ('sigma_m_garch', 'Script A2'),
+                    ('G_lstar_m', 'Script A3'), ('D_crisis_lstar', 'Script A3'),
+                    ('ports_raw', 'Script 3.2'), ('df_factors_4f', 'Script 3.1')]:
+    if var not in dir():
+        print(f"❌ '{var}' no está en memoria. Ejecuta {nombre} primero.")
+        raise SystemExit
+
+SCORES_A4 = ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']
+LABELS_A4 = {'ESG_Score': 'ESG Compuesto', 'E_Score': 'Pilar E',
+             'S_Score': 'Pilar S', 'G_Score': 'Pilar G'}
+CARTERAS_A4 = ['Q1', 'Q5', 'Q1-Q5']
+MODELOS = ['MS', 'GARCH', 'LSTAR-D']
+B_BOOT = 2000
+BLOQUE = 6                      # meses por bloque (captura persistencia de regímenes)
+rng = np.random.default_rng(42)
+
+RUTA_A4 = '/content/drive/MyDrive/TFM_STOXX600/HITO4/H3_ROBUSTEZ'
+try:
+    os.makedirs(RUTA_A4, exist_ok=True)
+except OSError:
+    RUTA_A4 = '.'
+
+
+def _stars_a4(p):
+    if   p < 0.01: return '***'
+    elif p < 0.05: return '**'
+    elif p < 0.10: return '*'
+    else:          return ''
+
+# ── Marco maestro mensual con las 3 clasificaciones alineadas ──────────────────
+idx_m = D_crisis.index
+df_regs = pd.DataFrame({
+    'Date':  idx_m,
+    'D_MS':  D_crisis.values,
+    'P_MS':  prob_crisis_mkt.reindex(idx_m).values,
+    'D_G':   D_crisis_garch.reindex(idx_m).values,
+    'SIG_G': sigma_m_garch.reindex(idx_m).values,
+    'D_L':   D_crisis_lstar.reindex(idx_m).values,
+    'G_L':   G_lstar_m.reindex(idx_m).values,
+})
+if df_regs.isna().any().any():
+    print("❌ Las clasificaciones no comparten el mismo índice mensual. Revisar A2/A3.")
+    raise SystemExit
+
+
+def _datos_completos(score, cartera):
+    df_p = ports_raw[score].merge(
+        df_factors_4f[['YearMonth', 'Rm_Rf']], on='YearMonth', how='inner')
+    df_p['Date'] = pd.to_datetime(df_p['Date'])
+    df_p = df_p.merge(df_regs, on='Date', how='inner')
+    ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+    cols = ['Date', ret_col, 'Rm_Rf', 'D_MS', 'D_G', 'D_L', 'G_L']
+    return df_p[cols].dropna().sort_values('Date').rename(columns={ret_col: 'Y'})
+
+
+def _capm_dummy(y, rm, d, hac=True):
+    """CAPM condicional; devuelve (δ, se, p, ssr) o NaN si d no varía."""
+    if d.sum() == 0 or d.sum() == len(d):
+        return np.nan, np.nan, np.nan, np.nan
+    X = sm.add_constant(np.column_stack([d, rm, d * rm]))
+    if hac:
+        m = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+    else:
+        m = sm.OLS(y, X).fit()
+    return m.params[3], m.bse[3], m.pvalues[3], m.ssr
+
+# ==============================================================================
+# SECCIÓN 1: CONCORDANCIA DE LAS CLASIFICACIONES DE RÉGIMEN
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 1: ¿Los tres modelos identifican los mismos estados del mercado?")
+print("─" * 80)
+
+n_m = len(df_regs)
+print(f"\n  BALANCE — meses en crisis sobre {n_m}:")
+print(f"    MS (P>0.5):           {int(df_regs['D_MS'].sum()):>3} ({df_regs['D_MS'].mean()*100:.0f}%)  ← criticado por desbalanceado")
+print(f"    GARCH (σ>P75):        {int(df_regs['D_G'].sum()):>3} ({df_regs['D_G'].mean()*100:.0f}%)  ← balance fijado por diseño")
+print(f"    LSTAR (G>0.5, descr.): {int(df_regs['D_L'].sum()):>2} ({df_regs['D_L'].mean()*100:.0f}%)  ← el modelo NO usa dummy (masa efectiva ΣG = {df_regs['G_L'].sum():.1f})")
+
+# RCM de Ang & Bekaert (2002): 400·E[p(1−p)]; 0 = clasificación nítida, 100 = ruido
+rcm_ms = 400 * (df_regs['P_MS'] * (1 - df_regs['P_MS'])).mean()
+rcm_ls = 400 * (df_regs['G_L'] * (1 - df_regs['G_L'])).mean()
+print(f"""
+  CALIDAD DE LA CLASIFICACIÓN (RCM, Ang & Bekaert 2002; 0=nítida, 100=ruido):
+    MS:    RCM = {rcm_ms:.1f}
+    LSTAR: RCM = {rcm_ls:.1f}
+  Un RCM bajo del MS indica que, aunque desbalanceada, la clasificación es
+  NÍTIDA (probabilidades cercanas a 0 o 1), no producto de ruido.""")
+
+
+def kappa_cohen(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    po = (a == b).mean()
+    pe = (a == 1).mean() * (b == 1).mean() + (a == 0).mean() * (b == 0).mean()
+    return (po - pe) / (1 - pe) if pe < 1 else np.nan
+
+
+print("\n  CONCORDANCIA ENTRE CLASIFICACIONES (kappa de Cohen):")
+print(f"  {'Par':<22} {'Acuerdo':>8} {'kappa':>7}  Lectura")
+print(f"  {'─'*62}")
+kappas = {}
+for (a, b, et) in [('D_MS', 'D_G', 'MS vs GARCH'),
+                   ('D_MS', 'D_L', 'MS vs LSTAR-D'),
+                   ('D_G', 'D_L', 'GARCH vs LSTAR-D')]:
+    k = kappa_cohen(df_regs[a], df_regs[b])
+    acuerdo = (df_regs[a] == df_regs[b]).mean()
+    kappas[et] = k
+    lect = ('casi perfecta' if k > 0.8 else 'sustancial' if k > 0.6 else
+            'moderada' if k > 0.4 else 'débil' if k > 0.2 else 'pobre')
+    print(f"  {et:<22} {acuerdo*100:>7.0f}% {k:>7.3f}  {lect} (Landis-Koch)")
+
+rho_pg, p_pg = stats.spearmanr(df_regs['P_MS'], df_regs['SIG_G'])
+rho_pl, p_pl = stats.spearmanr(df_regs['P_MS'], df_regs['G_L'])
+rho_gl, p_gl = stats.spearmanr(df_regs['SIG_G'], df_regs['G_L'])
+print(f"""
+  CORRELACIÓN DE SPEARMAN entre medidas continuas de estrés:
+    P(crisis) MS vs σ GARCH:  ρ = {rho_pg:.3f} (p = {p_pg:.2e})
+    P(crisis) MS vs G LSTAR:  ρ = {rho_pl:.3f} (p = {p_pl:.2e})
+    σ GARCH   vs G LSTAR:     ρ = {rho_gl:.3f} (p = {p_gl:.2e})
+""")
+
+# ==============================================================================
+# SECCIÓN 2: COMPARATIVA DE δ Y CONCORDANCIA DE LA DECISIÓN
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 2: δ (Δβ crisis−calma) bajo cada modelo — mismas carteras, misma n")
+print("─" * 80)
+print("""
+  Los tres δ de esta tabla provienen de la MISMA especificación de Etapa 2
+  (CAPM condicional con dummy, NW 3 lags); solo cambia CÓMO se define el
+  régimen. El δ continuo del LSTAR (Tabla A3) se reporta aparte.
+""")
+
+comparativa = []
+datos_cache = {}
+for score in SCORES_A4:
+    for cartera in CARTERAS_A4:
+        d = _datos_completos(score, cartera)
+        datos_cache[(score, cartera)] = d
+        fila = {'score': score, 'cartera': cartera, 'n': len(d)}
+        for m, col in [('MS', 'D_MS'), ('GARCH', 'D_G'), ('LSTAR-D', 'D_L')]:
+            delta, se, p, ssr = _capm_dummy(d['Y'].values, d['Rm_Rf'].values,
+                                            d[col].values.astype(float))
+            if p < 0.05:
+                dec = 'refugio' if delta < 0 else 'amplifica'
+            else:
+                dec = 'sin cambio'
+            fila.update({f'delta_{m}': delta, f'se_{m}': se,
+                         f'p_{m}': p, f'ssr_{m}': ssr, f'dec_{m}': dec})
+        fila['concordancia'] = len(set(fila[f'dec_{m}'] for m in MODELOS))
+        comparativa.append(fila)
+
+df_comp = pd.DataFrame(comparativa)
+
+print(f"  {'Score':<15} {'Cart.':<7} {'δ_MS':>7} {'p':>7} {'':>3} {'δ_GARCH':>8} {'p':>7} {'':>3} "
+      f"{'δ_LSTARD':>9} {'p':>7} {'':>3}  Decisión")
+print(f"  {'─'*100}")
+for _, f in df_comp.iterrows():
+    decs = [f[f'dec_{m}'] for m in MODELOS]
+    concuerda = '✅ ' + decs[0] if len(set(decs)) == 1 else '⚠️  ' + '/'.join(decs)
+    print(f"  {LABELS_A4[f['score']]:<15} {f['cartera']:<7} "
+          f"{f['delta_MS']:>7.3f} {f['p_MS']:>7.4f} {_stars_a4(f['p_MS']):>3} "
+          f"{f['delta_GARCH']:>8.3f} {f['p_GARCH']:>7.4f} {_stars_a4(f['p_GARCH']):>3} "
+          f"{f['delta_LSTAR-D']:>9.3f} {f['p_LSTAR-D']:>7.4f} {_stars_a4(f['p_LSTAR-D']):>3}  {concuerda}")
+
+n_conc = int((df_comp['concordancia'] == 1).sum())
+print(f"\n  Decisión cualitativa idéntica en los 3 modelos: {n_conc} de {len(df_comp)} carteras")
+
+if 'resultados_h3_lstar' in dir():
+    print("\n  Recordatorio — δ CONTINUO del LSTAR (ESG Compuesto, Tabla A3):")
+    for cartera in CARTERAS_A4:
+        r = resultados_h3_lstar.get(('ESG_Score', cartera))
+        if r is not None:
+            print(f"    {cartera:<7} δ = {r['delta']:+.3f} (p = {r['p_delta']:.4f}"
+                  f"{_stars_a4(r['p_delta'])}) | δ efectivo en muestra = {r['delta_efectivo']:+.3f}")
+
+# ==============================================================================
+# SECCIÓN 3: BOOTSTRAP PAREADO POR BLOQUES — H0: δ_alternativo = δ_MS
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print(f"SECCIÓN 3: Bootstrap pareado por bloques (B = {B_BOOT}, bloque = {BLOQUE} meses)")
+print("─" * 80)
+print("""
+  Se remuestrean los MISMOS meses para los tres modelos (pareado) en bloques
+  móviles que preservan la dependencia temporal. En cada réplica se
+  reestiman los δ y se computa la diferencia. Si el IC 95% de
+  (δ_alt − δ_MS) contiene el 0, la elección del modelo NO altera el
+  resultado de forma estadísticamente detectable.
+  (Clasificaciones de Etapa 1 fijas — inferencia condicional, como en 3.4.)
+""")
+
+
+def _delta_rapido(y, rm, d):
+    if d.sum() == 0 or d.sum() == len(d):
+        return np.nan
+    X = np.column_stack([np.ones(len(y)), d, rm, d * rm])
+    return np.linalg.lstsq(X, y, rcond=None)[0][3]
+
+
+def _idx_bloques(n, largo, rng):
+    n_b = int(np.ceil(n / largo))
+    starts = rng.integers(0, n - largo + 1, size=n_b)
+    return np.concatenate([np.arange(s, s + largo) for s in starts])[:n]
+
+
+boot_rows = []
+for score in SCORES_A4:
+    for cartera in CARTERAS_A4:
+        d = datos_cache[(score, cartera)]
+        y, rm = d['Y'].values, d['Rm_Rf'].values
+        dms = d['D_MS'].values.astype(float)
+        dg  = d['D_G'].values.astype(float)
+        dl  = d['D_L'].values.astype(float)
+        n = len(y)
+        dif_g, dif_l = [], []
+        for _ in range(B_BOOT):
+            ii = _idx_bloques(n, BLOQUE, rng)
+            d_ms_b = _delta_rapido(y[ii], rm[ii], dms[ii])
+            d_g_b  = _delta_rapido(y[ii], rm[ii], dg[ii])
+            d_l_b  = _delta_rapido(y[ii], rm[ii], dl[ii])
+            if not np.isnan(d_ms_b):
+                if not np.isnan(d_g_b): dif_g.append(d_g_b - d_ms_b)
+                if not np.isnan(d_l_b): dif_l.append(d_l_b - d_ms_b)
+        for et, difs in [('GARCH−MS', np.array(dif_g)), ('LSTARD−MS', np.array(dif_l))]:
+            lo, hi = np.percentile(difs, [2.5, 97.5])
+            p_boot = 2 * min((difs <= 0).mean(), (difs >= 0).mean())
+            boot_rows.append({'score': score, 'cartera': cartera, 'dif': et,
+                              'media': difs.mean(), 'ic_lo': lo, 'ic_hi': hi,
+                              'p_boot': p_boot, 'contiene_0': lo <= 0 <= hi})
+
+df_boot = pd.DataFrame(boot_rows)
+
+print(f"  {'Score':<15} {'Cart.':<7} {'Diferencia':<11} {'Media':>7} "
+      f"{'IC 2.5%':>8} {'IC 97.5%':>9} {'p_boot':>7}  ¿δ igual?")
+print(f"  {'─'*84}")
+for _, f in df_boot.iterrows():
+    igual = '✅ sí (IC∋0)' if f['contiene_0'] else '❌ NO'
+    print(f"  {LABELS_A4[f['score']]:<15} {f['cartera']:<7} {f['dif']:<11} "
+          f"{f['media']:>7.3f} {f['ic_lo']:>8.3f} {f['ic_hi']:>9.3f} "
+          f"{f['p_boot']:>7.3f}  {igual}")
+
+n_dif = int((~df_boot['contiene_0']).sum())
+print(f"\n  Diferencias de δ significativas al 5%: {n_dif} de {len(df_boot)} contrastes")
+
+# ==============================================================================
+# SECCIÓN 4: BONDAD DE AJUSTE COMPARADA (AIC / BIC, MISMA Y, MISMA n)
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 4: AIC/BIC de la Etapa 2 por modelo (k: dummies=4, LSTAR=6 por γ_T,c)")
+print("─" * 80)
+
+print(f"\n  {'Score':<15} {'Cart.':<7} {'AIC_MS':>8} {'AIC_GARCH':>10} {'AIC_LSTAR':>10}"
+      f" {'BIC_MS':>8} {'BIC_GARCH':>10} {'BIC_LSTAR':>10}  Mejor AIC")
+print(f"  {'─'*98}")
+aic_rows = []
+for score in SCORES_A4:
+    for cartera in CARTERAS_A4:
+        d = datos_cache[(score, cartera)]
+        y, rm, n = d['Y'].values, d['Rm_Rf'].values, len(d)
+        ics = {}
+        for m, col in [('MS', 'D_MS'), ('GARCH', 'D_G')]:
+            _, _, _, ssr = _capm_dummy(y, rm, d[col].values.astype(float), hac=False)
+            ics[f'AIC_{m}'] = n * np.log(ssr / n) + 2 * 4
+            ics[f'BIC_{m}'] = n * np.log(ssr / n) + 4 * np.log(n)
+        G = d['G_L'].values
+        X = sm.add_constant(np.column_stack([G, rm, G * rm]))
+        ssr_l = sm.OLS(y, X).fit().ssr
+        ics['AIC_LSTAR'] = n * np.log(ssr_l / n) + 2 * 6
+        ics['BIC_LSTAR'] = n * np.log(ssr_l / n) + 6 * np.log(n)
+        mejor = min(['MS', 'GARCH', 'LSTAR'], key=lambda m: ics[f'AIC_{m}'])
+        aic_rows.append({'score': score, 'cartera': cartera, **ics, 'mejor': mejor})
+        print(f"  {LABELS_A4[score]:<15} {cartera:<7} {ics['AIC_MS']:>8.1f} "
+              f"{ics['AIC_GARCH']:>10.1f} {ics['AIC_LSTAR']:>10.1f} {ics['BIC_MS']:>8.1f} "
+              f"{ics['BIC_GARCH']:>10.1f} {ics['BIC_LSTAR']:>10.1f}  {mejor}")
+
+df_aic = pd.DataFrame(aic_rows)
+print("\n  Recuento de 'mejor AIC':",
+      {m: int((df_aic['mejor'] == m).sum()) for m in ['MS', 'GARCH', 'LSTAR']})
+print("  Nota: |ΔAIC| < 2 entre modelos = ajuste equivalente (Burnham & Anderson).")
+
+# ==============================================================================
+# SECCIÓN 5: SENSIBILIDAD AL BALANCE — HALLAZGO CENTRAL (ESG Q5)
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 5: ¿Depende δ del GRADO DE BALANCE de la clasificación? (ESG Q5)")
+print("─" * 80)
+print("""
+  Respuesta directa a la observación del tribunal: se varía el corte que
+  determina cuántos meses caen en crisis (más laxo → más balanceado) y se
+  observa si δ y su significancia se mantienen.
+""")
+
+d_q5 = datos_cache[('ESG_Score', 'Q5')]
+d_q5 = d_q5.merge(df_regs[['Date', 'P_MS', 'SIG_G']], on='Date', how='left')
+
+sens_rows = []
+for corte in [0.30, 0.40, 0.50, 0.60, 0.70]:
+    dd = (d_q5['P_MS'] > corte).astype(float).values
+    delta, se, p, _ = _capm_dummy(d_q5['Y'].values, d_q5['Rm_Rf'].values, dd)
+    sens_rows.append({'regla': f'MS: P(crisis) > {corte:.2f}',
+                      'pct': dd.mean() * 100, 'delta': delta, 'p': p})
+for q in [0.70, 0.75, 0.80, 0.85]:
+    u = d_q5['SIG_G'].quantile(q)
+    dd = (d_q5['SIG_G'] > u).astype(float).values
+    delta, se, p, _ = _capm_dummy(d_q5['Y'].values, d_q5['Rm_Rf'].values, dd)
+    sens_rows.append({'regla': f'GARCH: σ > P{int(q*100)}',
+                      'pct': dd.mean() * 100, 'delta': delta, 'p': p})
+
+df_sens = pd.DataFrame(sens_rows)
+print(f"  {'Regla de clasificación':<26} {'% meses crisis':>14} {'δ (Q5 ESG)':>11} "
+      f"{'p':>8} {'Sig':>4}")
+print(f"  {'─'*70}")
+for _, f in df_sens.iterrows():
+    print(f"  {f['regla']:<26} {f['pct']:>13.0f}% {f['delta']:>11.3f} "
+          f"{f['p']:>8.4f} {_stars_a4(f['p']):>4}")
+
+rango_delta = df_sens['delta'].max() - df_sens['delta'].min()
+todas_sig = bool((df_sens['p'] < 0.05).all())
+mismo_signo = bool((np.sign(df_sens['delta']) == np.sign(df_sens['delta'].iloc[0])).all())
+print(f"""
+  Rango de δ entre reglas: {rango_delta:.3f} | mismo signo: {'sí' if mismo_signo else 'NO'} | """
+      f"""significativo al 5% en todas: {'sí' if todas_sig else 'NO'}""")
+
+# ==============================================================================
+# SECCIÓN 6: GRÁFICO COMPARATIVO Y EXPORTACIÓN
+# ==============================================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+fig.suptitle('H3 Robustez — ¿Afecta la elección del modelo calma/crisis al resultado?',
+             fontsize=12, fontweight='bold')
+
+ax = axes[0]
+x = np.arange(len(CARTERAS_A4))
+colores = {'MS': '#2c3e50', 'GARCH': '#1a9641', 'LSTAR-D': '#d73027'}
+for j, m in enumerate(MODELOS):
+    sub = df_comp[df_comp['score'] == 'ESG_Score']
+    dlt = [sub[sub['cartera'] == c][f'delta_{m}'].iloc[0] for c in CARTERAS_A4]
+    se  = [sub[sub['cartera'] == c][f'se_{m}'].iloc[0] for c in CARTERAS_A4]
+    ax.errorbar(x + (j - 1) * 0.15, dlt, yerr=1.96 * np.array(se), fmt='o',
+                capsize=4, markersize=7, color=colores[m], label=m)
+ax.axhline(0, color='black', lw=0.8)
+ax.set_xticks(x)
+ax.set_xticklabels(CARTERAS_A4)
+ax.set_ylabel('δ = Δβ (crisis − calma)')
+ax.set_title('δ ± IC 95% (NW) por modelo — ESG Compuesto', fontsize=10)
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3, axis='y')
+
+ax = axes[1]
+mask_ms = df_sens['regla'].str.startswith('MS')
+ax.scatter(df_sens.loc[mask_ms, 'pct'], df_sens.loc[mask_ms, 'delta'],
+           s=70, color='#2c3e50', label='reglas MS (corte P)', zorder=3)
+ax.scatter(df_sens.loc[~mask_ms, 'pct'], df_sens.loc[~mask_ms, 'delta'],
+           s=70, color='#1a9641', marker='s', label='reglas GARCH (cuantil σ)', zorder=3)
+ax.axhline(0, color='black', lw=0.8)
+ax.set_xlabel('% de meses clasificados en crisis (grado de balance)')
+ax.set_ylabel('δ (Q5, ESG Compuesto)')
+ax.set_title('Sensibilidad de δ al grado de balance de la clasificación', fontsize=10)
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+ruta = f'{RUTA_A4}/a4_contraste_modelos.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"\n   ✅ Gráfico guardado: {ruta}")
+
+for nombre, df_out in [('a4_tabla_comparativa_delta.csv', df_comp.drop(columns=[c for c in df_comp.columns if c.startswith('ssr')])),
+                       ('a4_bootstrap_diferencias.csv', df_boot),
+                       ('a4_aic_bic.csv', df_aic),
+                       ('a4_sensibilidad_balance.csv', df_sens)]:
+    df_out.to_csv(f'{RUTA_A4}/{nombre}', index=False)
+    print(f"   ✅ CSV guardado: {RUTA_A4}/{nombre}")
+
+# ==============================================================================
+# SECCIÓN 7: VEREDICTO SEGÚN EL CRITERIO PRE-ESPECIFICADO
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("SECCIÓN 7: VEREDICTO — ¿HAY QUE CAMBIAR EL MODELO DE LA H3?")
+print("=" * 80)
+
+# Criterio (i): decisión cualitativa del hallazgo central coincide en los 3 modelos
+f_q1 = df_comp[(df_comp['score'] == 'ESG_Score') & (df_comp['cartera'] == 'Q1')].iloc[0]
+f_q5 = df_comp[(df_comp['score'] == 'ESG_Score') & (df_comp['cartera'] == 'Q5')].iloc[0]
+crit1 = (len(set(f_q1[f'dec_{m}'] for m in MODELOS)) == 1 and
+         len(set(f_q5[f'dec_{m}'] for m in MODELOS)) == 1)
+
+# Criterio (ii): bootstrap — δ estadísticamente iguales en el hallazgo central
+boot_c = df_boot[(df_boot['score'] == 'ESG_Score') &
+                 (df_boot['cartera'].isin(['Q1', 'Q5']))]
+crit2 = bool(boot_c['contiene_0'].all())
+
+# Criterio (iii): δ estable ante el grado de balance
+crit3 = mismo_signo and todas_sig
+
+print(f"""
+  Criterio (i)   Decisión cualitativa idéntica en los 3 modelos (ESG Q1 y Q5): {'✅ SÍ' if crit1 else '❌ NO'}
+                 Q1: {' / '.join(f_q1[f'dec_{m}'] for m in MODELOS)} | Q5: {' / '.join(f_q5[f'dec_{m}'] for m in MODELOS)}
+  Criterio (ii)  IC bootstrap de (δ_alt − δ_MS) contiene 0 (ESG Q1 y Q5):      {'✅ SÍ' if crit2 else '❌ NO'}
+  Criterio (iii) δ de Q5 estable al variar el balance (signo + significancia): {'✅ SÍ' if crit3 else '❌ NO'}
+""")
+
+if crit1 and crit2 and crit3:
+    print("""  ═══════════════════════════════════════════════════════════════════════
+  ✅ VEREDICTO: MANTENER el MS-CAPM como modelo principal de la H3.
+  ═══════════════════════════════════════════════════════════════════════
+  El desbalance de regímenes NO afecta al resultado: el hallazgo (Q5
+  amplifica su beta en crisis; Q1 estable) es invariante al modelo de
+  detección de regímenes (mezcla markoviana, umbral GARCH o transición
+  suave) y al grado de balance de la clasificación. El desbalance refleja
+  una característica REAL del período muestral (las crisis son escasas por
+  naturaleza), no un artefacto del método.
+  → Respuesta al tribunal: incorporar este anexo de robustez (tablas de
+    concordancia, bootstrap y sensibilidad) sin cambiar el modelo principal.""")
+else:
+    print("""  ═══════════════════════════════════════════════════════════════════════
+  ⚠️  VEREDICTO: la elección del modelo SÍ afecta al resultado.
+  ═══════════════════════════════════════════════════════════════════════
+  Revisar qué criterio falla (arriba) y en qué dirección:
+  · Si falla (i) o (ii): el hallazgo central depende del método → adoptar
+    como principal el modelo con mejor AIC/BIC (Sección 4) y reportar los
+    demás como sensibilidad, discutiendo la divergencia.
+  · Si solo falla (iii): el resultado depende del grado de balance →
+    preferir el GARCH-umbral (balance por diseño) o el LSTAR (sin
+    clasificación) como especificación principal.""")
+
+print(f"\nFin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)

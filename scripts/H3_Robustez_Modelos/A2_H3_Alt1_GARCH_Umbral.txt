@@ -1,0 +1,275 @@
+# ==============================================================================
+# SCRIPT A2 — ROBUSTEZ H3 (MODELO ALTERNATIVO 1): GARCH(1,1) + UMBRAL DE VOLATILIDAD
+# ==============================================================================
+#
+# MOTIVACIÓN (observación del tribunal, Hito 4): el MS(2) clasifica solo
+# 18 de 120 meses como crisis (15%) — regímenes DESBALANCEADOS. El δ del
+# CAPM condicional se estima con pocas observaciones en el régimen de crisis.
+#
+# ALTERNATIVA 1 — GARCH(1,1)-t con umbral de cuantil:
+#   σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}   (retornos diarios del mercado)
+#   Mes en CRISIS si la volatilidad condicional media del mes supera el
+#   cuantil P75 de la distribución mensual → 25% de meses en crisis
+#   POR CONSTRUCCIÓN. El balance deja de ser un resultado endógeno de una
+#   mezcla gaussiana y pasa a ser una decisión de diseño transparente,
+#   con sensibilidad P70/P80/P85 (Script A4).
+#
+# POR QUÉ RESPONDE A LA CRÍTICA:
+#   (a) No estima mezclas → no hay riesgo de régimen degenerado ni de
+#       clasificación dominada por un solo episodio.
+#   (b) El grado de balance es explícito y contrastable (análisis de
+#       sensibilidad del umbral en A4).
+#   (c) GARCH(1,1) es el modelo canónico de volatilidad (Bollerslev 1986);
+#       la clasificación por umbral de volatilidad sigue a Schwert (1989).
+#
+# ETAPA 2: idéntica al Script 3.4 (CAPM condicional OLS + Newey-West),
+# solo cambia la dummy de régimen → los δ son directamente comparables.
+#
+# REQUIERE EN MEMORIA (ejecutar ANTES el pipeline completo hasta Script 3.4):
+#   rm_diario (3.4) + ports_raw (3.2) + df_factors_4f (3.1)
+# ==============================================================================
+
+import subprocess, sys
+try:
+    from arch import arch_model
+except ImportError:
+    print("Instalando librería 'arch'...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "arch"])
+    from arch import arch_model
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT A2: H3 ROBUSTEZ — ALTERNATIVA 1: GARCH(1,1) + UMBRAL DE VOLATILIDAD")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, nombre in [('rm_diario', 'Script 3.4'),
+                    ('ports_raw', 'Script 3.2'),
+                    ('df_factors_4f', 'Script 3.1')]:
+    if var not in dir():
+        print(f"❌ '{var}' no está en memoria. Ejecuta {nombre} primero.")
+        raise SystemExit
+
+if 'STOXX_VERSION' not in dir():
+    STOXX_VERSION = 'versión no identificada'
+
+SCORES_A2 = ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']
+LABELS_A2 = {'ESG_Score': 'ESG Compuesto', 'E_Score': 'Pilar E',
+             'S_Score': 'Pilar S', 'G_Score': 'Pilar G'}
+CARTERAS_A2 = ['Q1', 'Q5', 'Q1-Q5']
+
+UMBRAL_GARCH_Q = 0.75   # cuantil principal (crisis = cuartil superior de vol.)
+
+
+def _stars_a2(p):
+    if   p < 0.01: return '***'
+    elif p < 0.05: return '**'
+    elif p < 0.10: return '*'
+    else:          return ''
+
+# ==============================================================================
+# SECCIÓN 1: GARCH(1,1)-t SOBRE RETORNOS DIARIOS DEL MERCADO
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 1: GARCH(1,1)-t sobre el retorno diario del STOXX 600")
+print("─" * 80)
+
+# arch trabaja mejor con retornos en % (estabilidad numérica)
+ret_pct = rm_diario * 100
+
+mod_g = arch_model(ret_pct, mean='Constant', vol='GARCH', p=1, q=1, dist='t')
+res_garch_fit = mod_g.fit(disp='off')
+
+omega_g = res_garch_fit.params['omega']
+alpha_g = res_garch_fit.params['alpha[1]']
+beta_g  = res_garch_fit.params['beta[1]']
+nu_g    = res_garch_fit.params.get('nu', np.nan)
+persist = alpha_g + beta_g
+half_life = np.log(0.5) / np.log(persist) if persist < 1 else np.inf
+
+# Volatilidad condicional diaria (%/día) y agregación mensual
+sigma_d_garch = pd.Series(res_garch_fit.conditional_volatility.values,
+                          index=ret_pct.index, name='sigma_garch')
+sigma_m_garch = sigma_d_garch.groupby(sigma_d_garch.index.to_period('M')).mean()
+fechas_m_g = sigma_m_garch.index.to_timestamp()
+sigma_m_garch = pd.Series(sigma_m_garch.values, index=fechas_m_g, name='sigma_m')
+
+print(f"""
+  PARÁMETROS GARCH(1,1)-t ({len(ret_pct):,} días):
+    ω = {omega_g:.5f} | α = {alpha_g:.4f} | β = {beta_g:.4f} | ν (g.l. t) = {nu_g:.2f}
+    Persistencia α+β = {persist:.4f} | Semivida del shock = {half_life:.1f} días
+    Log-verosimilitud = {res_garch_fit.loglikelihood:.1f} | AIC = {res_garch_fit.aic:.1f} | BIC = {res_garch_fit.bic:.1f}
+
+  Volatilidad condicional mensual (media de σ_t diaria, %/día):
+    mín = {sigma_m_garch.min():.3f} | mediana = {sigma_m_garch.median():.3f} | máx = {sigma_m_garch.max():.3f}
+    (anualizada: mín {sigma_m_garch.min()*np.sqrt(252):.1f}% | máx {sigma_m_garch.max()*np.sqrt(252):.1f}%)
+""")
+
+# ==============================================================================
+# SECCIÓN 2: CLASIFICACIÓN CALMA/CRISIS POR UMBRAL DE CUANTIL
+# ==============================================================================
+
+print("─" * 80)
+print(f"SECCIÓN 2: Clasificación por umbral — crisis si σ_mes > P{int(UMBRAL_GARCH_Q*100)}")
+print("─" * 80)
+
+umbral_g = sigma_m_garch.quantile(UMBRAL_GARCH_Q)
+D_crisis_garch = (sigma_m_garch > umbral_g).astype(int)
+D_crisis_garch.name = 'D_crisis_garch'
+
+print(f"\n  Umbral P{int(UMBRAL_GARCH_Q*100)}: σ = {umbral_g:.3f}%/día "
+      f"({umbral_g*np.sqrt(252):.1f}% anualizada)")
+print(f"  Meses en crisis: {int(D_crisis_garch.sum())} de {len(D_crisis_garch)} "
+      f"({D_crisis_garch.mean()*100:.0f}%) — balance fijado POR DISEÑO")
+
+# Reglas alternativas (informativo; la sensibilidad formal está en A4)
+print("\n  Reglas alternativas de clasificación (informativo):")
+print(f"  {'Regla':<28} {'Umbral σ':>10} {'Meses crisis':>13} {'%':>6}")
+print(f"  {'─'*62}")
+for q in [0.70, 0.75, 0.80, 0.85]:
+    u = sigma_m_garch.quantile(q)
+    n = int((sigma_m_garch > u).sum())
+    print(f"  {'Cuantil P' + str(int(q*100)):<28} {u:>10.3f} {n:>13} {n/len(sigma_m_garch)*100:>5.0f}%")
+u_sd = sigma_m_garch.mean() + sigma_m_garch.std()
+n_sd = int((sigma_m_garch > u_sd).sum())
+print(f"  {'Media + 1 desv. est.':<28} {u_sd:>10.3f} {n_sd:>13} {n_sd/len(sigma_m_garch)*100:>5.0f}%")
+
+# Episodios de crisis detectados
+episodios_garch = []
+inicio = None
+en_crisis_g = D_crisis_garch.astype(bool)
+for i, (fecha, es_c) in enumerate(zip(D_crisis_garch.index, en_crisis_g)):
+    if es_c and inicio is None:
+        inicio = fecha
+    elif not es_c and inicio is not None:
+        episodios_garch.append((inicio, D_crisis_garch.index[i-1]))
+        inicio = None
+if inicio is not None:
+    episodios_garch.append((inicio, D_crisis_garch.index[-1]))
+
+print(f"\n  EPISODIOS DE CRISIS (GARCH P{int(UMBRAL_GARCH_Q*100)}):")
+for ini, fin in episodios_garch:
+    n_m = ((fin.year - ini.year) * 12 + fin.month - ini.month) + 1
+    print(f"    {ini.strftime('%Y-%m')} → {fin.strftime('%Y-%m')}  ({n_m} meses)")
+
+# ==============================================================================
+# SECCIÓN 3: ETAPA 2 — CAPM CONDICIONAL CON LA DUMMY GARCH
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 3: CAPM condicional — misma especificación que Script 3.4")
+print("           R_p−R_f = α + γ·D + β·Rm_Rf + δ·(D×Rm_Rf) | OLS + Newey-West(3)")
+print("─" * 80)
+
+df_regimen_garch = pd.DataFrame({
+    'Date': D_crisis_garch.index,
+    'D_crisis_g': D_crisis_garch.values,
+    'sigma_m': sigma_m_garch.values,
+})
+
+
+def capm_condicional_garch(score, cartera):
+    df_p = ports_raw[score].merge(
+        df_factors_4f[['YearMonth', 'Rm_Rf']], on='YearMonth', how='inner')
+    df_p['Date'] = pd.to_datetime(df_p['Date'])
+    df_p = df_p.merge(df_regimen_garch, on='Date', how='inner')
+
+    ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+    datos = df_p[['Date', ret_col, 'Rm_Rf', 'D_crisis_g']].dropna().sort_values('Date')
+    if len(datos) < 24:
+        return None
+
+    datos['D_x_Rm'] = datos['D_crisis_g'] * datos['Rm_Rf']
+    Y = datos[ret_col].values
+    X = sm.add_constant(datos[['D_crisis_g', 'Rm_Rf', 'D_x_Rm']].values)
+
+    m_nw = sm.OLS(Y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+    m_ols = sm.OLS(Y, X).fit()
+    alpha, gamma, beta, delta = m_nw.params
+
+    return {'score': score, 'cartera': cartera, 'n': len(datos),
+            'beta_calma': beta, 'beta_crisis': beta + delta,
+            'delta': delta, 't_delta': m_nw.tvalues[3], 'p_delta': m_nw.pvalues[3],
+            'se_delta': m_nw.bse[3], 'wald': m_nw.tvalues[3]**2,
+            'R2': m_ols.rsquared, 'ssr': m_ols.ssr,
+            'modelo_nw': m_nw, 'datos': datos}
+
+
+resultados_h3_garch = {}
+for score in SCORES_A2:
+    for cartera in CARTERAS_A2:
+        r = capm_condicional_garch(score, cartera)
+        if r is not None:
+            resultados_h3_garch[(score, cartera)] = r
+
+print(f"\n  ✅ Modelos estimados: {len(resultados_h3_garch)} / {len(SCORES_A2)*len(CARTERAS_A2)}\n")
+
+print("═" * 80)
+print("TABLA A2 — CAPM CONDICIONAL CON RÉGIMEN GARCH-UMBRAL (Wald: H0 δ=0)")
+print("═" * 80)
+for score in SCORES_A2:
+    print(f"\n  {LABELS_A2[score]}")
+    print(f"  {'Cartera':<8} {'β_calma':>8} {'β_crisis':>9} {'Δβ (δ)':>8} "
+          f"{'t(δ)':>7} {'p(δ)':>8} {'Sig':>4} {'Wald χ²':>9} {'R²':>6}")
+    print(f"  {'─'*76}")
+    for cartera in CARTERAS_A2:
+        r = resultados_h3_garch.get((score, cartera))
+        if r is None:
+            continue
+        print(f"  {cartera:<8} {r['beta_calma']:>8.3f} {r['beta_crisis']:>9.3f} "
+              f"{r['delta']:>8.3f} {r['t_delta']:>7.2f} {r['p_delta']:>8.4f} "
+              f"{_stars_a2(r['p_delta']):>4} {r['wald']:>9.3f} {r['R2']:>6.3f}")
+
+# ==============================================================================
+# SECCIÓN 4: GRÁFICO — VOLATILIDAD CONDICIONAL Y RÉGIMEN
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 4: Gráfico — volatilidad condicional GARCH y clasificación")
+print("─" * 80)
+
+RUTA_A2 = '/content/drive/MyDrive/TFM_STOXX600/HITO4/H3_ROBUSTEZ'
+try:
+    os.makedirs(RUTA_A2, exist_ok=True)
+except OSError:
+    RUTA_A2 = '.'
+
+fig, ax = plt.subplots(figsize=(13, 5.5))
+ax.plot(sigma_d_garch.index, sigma_d_garch * np.sqrt(252),
+        color='#2c3e50', linewidth=0.8, label='σ condicional GARCH (anualizada)')
+for ini, fin in episodios_garch:
+    ax.axvspan(ini, fin + pd.offsets.MonthEnd(0), color='#d73027', alpha=0.18)
+ax.axhline(umbral_g * np.sqrt(252), color='#d73027', linewidth=1.2, linestyle='--',
+           label=f'Umbral P{int(UMBRAL_GARCH_Q*100)} ({umbral_g*np.sqrt(252):.1f}%)')
+ax.set_title('H3 Robustez — Alternativa 1: régimen de crisis por GARCH(1,1) + umbral\n'
+             f'STOXX 600 {STOXX_VERSION} — sombreado = mes en crisis '
+             f'({int(D_crisis_garch.sum())}/{len(D_crisis_garch)} meses, balance por diseño)',
+             fontsize=11, fontweight='bold')
+ax.set_ylabel('Volatilidad anualizada (%)')
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+plt.tight_layout()
+ruta = f'{RUTA_A2}/a2_garch_regimen.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+print(f"""
+{'='*80}
+RESUMEN A2 — variables exportadas a memoria (las usa el Script A4):
+  sigma_d_garch, sigma_m_garch, D_crisis_garch, df_regimen_garch,
+  resultados_h3_garch, res_garch_fit, UMBRAL_GARCH_Q, episodios_garch
+{'='*80}
+Fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}""")

@@ -1,0 +1,553 @@
+# ==============================================================================
+# SCRIPT A5 — ROBUSTEZ H3: DIAGNÓSTICO DIRECCIONAL — ¿CRISIS BAJISTA O SOLO VOLÁTIL?
+# ==============================================================================
+#
+# MOTIVACIÓN (resultado del Script A4): los tres modelos coinciden en RECHAZAR
+# H3 (el ESG no es refugio), pero el HALLAZGO ESPECULAR diverge: bajo MS quien
+# amplifica beta en crisis es Q5 (peor ESG); bajo GARCH-umbral y LSTAR es Q1.
+#
+# HIPÓTESIS DE TRABAJO DE ESTE SCRIPT: la divergencia se debe a que los
+# modelos definen "crisis" de forma distinta:
+#   · El MS estima MEDIA y varianza cambiantes → su régimen de crisis es un
+#     régimen BAJISTA (μ = −0.19%/día): pánico con caídas.
+#   · GARCH-umbral y LSTAR clasifican SOLO por volatilidad → etiquetan como
+#     crisis también los REBOTES en V (jul/ago/nov-2020) y sustos de
+#     volatilidad sin mercado bajista (feb-2018, ago-2019, mar-2023).
+#
+# CONTRASTE EN TRES PASOS:
+#   1. DIAGNÓSTICO: identificar los meses discordantes entre clasificaciones
+#      y verificar si son meses de retorno POSITIVO (rebotes).
+#   2. VERSIONES DIRECCIONALES de los modelos alternativos:
+#      · GARCH-direccional: crisis = σ_mes > P75  Y  retorno mensual < 0
+#      · LSTAR-bajista: variable de transición = SEMIVOLATILIDAD NEGATIVA
+#        realizada, RV⁻ = sqrt(Σ min(r_d,0)²) — solo el riesgo a la baja
+#        (Markowitz 1959; Ang, Chen & Xing 2006)
+#   3. VEREDICTO: si las versiones direccionales reproducen el patrón del MS
+#      (Q5 amplifica, Q1 estable), el hallazgo especular queda RESCATADO y
+#      precisado: la protección relativa del ESG opera en mercados BAJISTAS.
+#      La divergencia del A4 pasa a ser un resultado interpretable
+#      (regímenes bajistas ≠ regímenes de alta volatilidad), no una debilidad.
+#
+# REQUIERE EN MEMORIA: Script 3.4 (rm_diario, D_crisis, prob_crisis_mkt) +
+#   Script A2 (sigma_m_garch, D_crisis_garch) + Script A3 (s_lstar_m,
+#   G_lstar_m, D_crisis_lstar) + ports_raw + df_factors_4f
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from scipy import stats
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+from datetime import datetime
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT A5: H3 ROBUSTEZ — DIAGNÓSTICO DIRECCIONAL (BAJISTA vs VOLÁTIL)")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, nombre in [('rm_diario', 'Script 3.4'), ('D_crisis', 'Script 3.4'),
+                    ('prob_crisis_mkt', 'Script 3.4'),
+                    ('sigma_m_garch', 'Script A2'), ('D_crisis_garch', 'Script A2'),
+                    ('s_lstar_m', 'Script A3'), ('D_crisis_lstar', 'Script A3'),
+                    ('ports_raw', 'Script 3.2'), ('df_factors_4f', 'Script 3.1')]:
+    if var not in dir():
+        print(f"❌ '{var}' no está en memoria. Ejecuta {nombre} primero.")
+        raise SystemExit
+
+SCORES_A5 = ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']
+LABELS_A5 = {'ESG_Score': 'ESG Compuesto', 'E_Score': 'Pilar E',
+             'S_Score': 'Pilar S', 'G_Score': 'Pilar G'}
+CARTERAS_A5 = ['Q1', 'Q5', 'Q1-Q5']
+B_BOOT_A5 = 2000
+BLOQUE_A5 = 6
+rng_a5 = np.random.default_rng(42)
+
+RUTA_A5 = '/content/drive/MyDrive/TFM_STOXX600/HITO4/H3_ROBUSTEZ'
+try:
+    os.makedirs(RUTA_A5, exist_ok=True)
+except OSError:
+    RUTA_A5 = '.'
+
+
+def _stars_a5(p):
+    if   p < 0.01: return '***'
+    elif p < 0.05: return '**'
+    elif p < 0.10: return '*'
+    else:          return ''
+
+
+def _G_log(s, gamma_t, c):
+    z = np.clip(-gamma_t * (s - c), -35, 35)
+    return 1.0 / (1.0 + np.exp(z))
+
+# ==============================================================================
+# SECCIÓN 1: DIAGNÓSTICO — ¿QUIÉNES SON LOS MESES DISCORDANTES?
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 1: Meses discordantes entre clasificaciones y su dirección")
+print("─" * 80)
+
+idx_m = D_crisis.index
+
+# Retorno mensual compuesto del mercado (dirección) y RV mensual
+rm_m = rm_diario.groupby(rm_diario.index.to_period('M')).apply(
+    lambda x: (1 + x).prod() - 1)
+rm_m = pd.Series(rm_m.values, index=rm_m.index.to_timestamp(), name='Rm_mes')
+
+rv_m_a5 = rm_diario.groupby(rm_diario.index.to_period('M')).apply(
+    lambda x: np.sqrt((x ** 2).sum()))
+rv_m_a5 = pd.Series(rv_m_a5.values, index=rv_m_a5.index.to_timestamp(), name='RV_m')
+
+df_diag = pd.DataFrame({
+    'Rm_mes': rm_m.reindex(idx_m).values,
+    'RV_m':   rv_m_a5.reindex(idx_m).values,
+    'P_MS':   prob_crisis_mkt.reindex(idx_m).values,
+    'SIG_G':  sigma_m_garch.reindex(idx_m).values,
+    'D_MS':   D_crisis.values,
+    'D_G':    D_crisis_garch.reindex(idx_m).values,
+    'D_L':    D_crisis_lstar.reindex(idx_m).values,
+}, index=idx_m)
+
+grupos = {
+    'Ambos CRISIS (MS=1, G=1)':   df_diag[(df_diag.D_MS == 1) & (df_diag.D_G == 1)],
+    'Solo GARCH  (MS=0, G=1)':    df_diag[(df_diag.D_MS == 0) & (df_diag.D_G == 1)],
+    'Solo MS     (MS=1, G=0)':    df_diag[(df_diag.D_MS == 1) & (df_diag.D_G == 0)],
+    'Ambos CALMA (MS=0, G=0)':    df_diag[(df_diag.D_MS == 0) & (df_diag.D_G == 0)],
+}
+
+print(f"\n  CONTRASTE MS vs GARCH-P75 — dirección del mercado por grupo:")
+print(f"  {'Grupo':<28} {'n':>4} {'Rm medio %/mes':>15} {'% meses Rm>0':>13}")
+print(f"  {'─'*66}")
+for nombre, g in grupos.items():
+    if len(g) == 0:
+        continue
+    print(f"  {nombre:<28} {len(g):>4} {g['Rm_mes'].mean()*100:>15.2f} "
+          f"{(g['Rm_mes'] > 0).mean()*100:>12.0f}%")
+
+solo_g = grupos['Solo GARCH  (MS=0, G=1)']
+ambos = grupos['Ambos CRISIS (MS=1, G=1)']
+print(f"""
+  LECTURA: si los meses 'Solo GARCH' tienen retorno medio POSITIVO mientras
+  los 'Ambos CRISIS' lo tienen negativo, el GARCH-umbral está etiquetando
+  como crisis los REBOTES y sustos de volatilidad — estados que el MS
+  (con media cambiante) correctamente separa del régimen bajista.""")
+
+# Detalle de los meses discordantes (MS vs GARCH y MS vs LSTAR)
+disc = df_diag[(df_diag.D_MS != df_diag.D_G) | (df_diag.D_MS != df_diag.D_L)].copy()
+print(f"\n  DETALLE DE LOS {len(disc)} MESES DISCORDANTES:")
+print(f"  {'Mes':<9} {'Rm %':>7} {'RV %':>6} {'P_MS':>6} {'σ_G':>6} "
+      f"{'MS':>3} {'GARCH':>6} {'LSTAR':>6}  Lectura")
+print(f"  {'─'*78}")
+for fecha, f in disc.iterrows():
+    if f.D_MS == 0 and (f.D_G == 1 or f.D_L == 1):
+        lect = 'rebote/susto vol.' if f.Rm_mes > 0 else 'caída no-MS'
+    else:
+        lect = 'bajista solo-MS'
+    print(f"  {fecha.strftime('%Y-%m'):<9} {f.Rm_mes*100:>7.2f} {f.RV_m*100:>6.2f} "
+          f"{f.P_MS:>6.2f} {f.SIG_G:>6.2f} {int(f.D_MS):>3} {int(f.D_G):>6} "
+          f"{int(f.D_L):>6}  {lect}")
+
+n_rebotes = int(((disc.D_MS == 0) & ((disc.D_G == 1) | (disc.D_L == 1)) &
+                 (disc.Rm_mes > 0)).sum())
+n_alt_extra = int(((disc.D_MS == 0) & ((disc.D_G == 1) | (disc.D_L == 1))).sum())
+print(f"\n  Meses crisis solo-alternativos: {n_alt_extra} | de ellos con Rm>0 "
+      f"(rebotes): {n_rebotes} ({(n_rebotes/max(n_alt_extra,1))*100:.0f}%)")
+
+# ==============================================================================
+# SECCIÓN 2: MODELOS DIRECCIONALES
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 2: Versiones direccionales de los modelos alternativos")
+print("─" * 80)
+
+# ── 2A. GARCH-direccional: σ > P75  Y  retorno mensual < 0 ────────────────────
+umbral_g75 = sigma_m_garch.quantile(0.75)
+D_dir_garch = ((sigma_m_garch.reindex(idx_m) > umbral_g75) &
+               (rm_m.reindex(idx_m) < 0)).astype(int)
+D_dir_garch.name = 'D_dir_garch'
+
+print(f"""
+  2A. GARCH-DIRECCIONAL: crisis = (σ_mes > P75) ∧ (Rm_mes < 0)
+      Meses en crisis: {int(D_dir_garch.sum())} de {len(D_dir_garch)} """
+      f"""(GARCH sin dirección: {int(df_diag.D_G.sum())})""")
+
+episodios_dir = []
+inicio = None
+for i, (fecha, es_c) in enumerate(zip(D_dir_garch.index, D_dir_garch.astype(bool))):
+    if es_c and inicio is None:
+        inicio = fecha
+    elif not es_c and inicio is not None:
+        episodios_dir.append((inicio, D_dir_garch.index[i-1]))
+        inicio = None
+if inicio is not None:
+    episodios_dir.append((inicio, D_dir_garch.index[-1]))
+print("      Episodios:", ', '.join(
+    f"{i.strftime('%Y-%m')}→{f.strftime('%Y-%m')}" for i, f in episodios_dir))
+
+# ── 2B. LSTAR-bajista: transición = semivolatilidad NEGATIVA realizada ─────────
+rv_neg = rm_diario.groupby(rm_diario.index.to_period('M')).apply(
+    lambda x: np.sqrt((np.minimum(x, 0) ** 2).sum()))
+rv_neg = pd.Series(rv_neg.values, index=rv_neg.index.to_timestamp(), name='RV_neg')
+rv_neg = rv_neg.clip(lower=rv_neg[rv_neg > 0].min())   # evita log(0)
+
+log_rvn = np.log(rv_neg)
+s_neg_m = (log_rvn - log_rvn.mean()) / log_rvn.std()
+s_neg_m.name = 's_neg'
+
+print(f"""
+  2B. LSTAR-BAJISTA: s_t = log semivolatilidad negativa RV⁻, estandarizada
+      RV⁻: mín = {rv_neg.min()*100:.2f}%/mes | mediana = {rv_neg.median()*100:.2f}%/mes | máx = {rv_neg.max()*100:.2f}%/mes
+      Correlación con RV total: {np.corrcoef(s_neg_m.values, ((np.log(rv_m_a5)-np.log(rv_m_a5).mean())/np.log(rv_m_a5).std()).reindex(s_neg_m.index).values)[0,1]:.3f} """
+      f"""(< 1: el downside añade información direccional)""")
+
+df_sneg = pd.DataFrame({'Date': s_neg_m.index, 's_t': s_neg_m.values})
+
+
+def _datos_cartera_a5(score, cartera):
+    df_p = ports_raw[score].merge(
+        df_factors_4f[['YearMonth', 'Rm_Rf']], on='YearMonth', how='inner')
+    df_p['Date'] = pd.to_datetime(df_p['Date'])
+    df_p = df_p.merge(df_sneg, on='Date', how='inner')
+    ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+    d = df_p[['Date', ret_col, 'Rm_Rf', 's_t']].dropna().sort_values('Date')
+    return d.rename(columns={ret_col: 'Y'})
+
+
+def _ssr_conc_a5(y, rm, s, gamma_t, c):
+    G = _G_log(s, gamma_t, c)
+    X = np.column_stack([np.ones(len(y)), G, rm, G * rm])
+    coef = np.linalg.lstsq(X, y, rcond=None)[0]
+    u = y - X @ coef
+    return float(u @ u)
+
+
+eqs_a5 = {c: _datos_cartera_a5('ESG_Score', c) for c in CARTERAS_A5}
+pesos_a5 = {}
+for c, d in eqs_a5.items():
+    pesos_a5[c] = 1.0 / float(sm.OLS(d['Y'].values,
+                                     sm.add_constant(d['Rm_Rf'].values)).fit().ssr)
+
+
+def objetivo_a5(params):
+    log_g, c = params
+    gamma_t = np.exp(log_g)
+    if not (0.05 <= gamma_t <= 500) or not (-2.5 <= c <= 2.5):
+        return 1e12
+    return sum(pesos_a5[k] * _ssr_conc_a5(d['Y'].values, d['Rm_Rf'].values,
+                                          d['s_t'].values, gamma_t, c)
+               for k, d in eqs_a5.items())
+
+
+grid_c5 = np.quantile(s_neg_m.values, np.linspace(0.15, 0.90, 16))
+grid_g5 = np.geomspace(0.5, 60, 12)
+mejor5 = (np.inf, None)
+for g in grid_g5:
+    for c in grid_c5:
+        val = objetivo_a5((np.log(g), c))
+        if val < mejor5[0]:
+            mejor5 = (val, (np.log(g), c))
+opt5 = minimize(objetivo_a5, x0=np.array(mejor5[1]), method='Nelder-Mead',
+                options={'xatol': 1e-4, 'fatol': 1e-10, 'maxiter': 2000})
+gamma_neg = float(np.exp(opt5.x[0]))
+c_neg = float(opt5.x[1])
+G_neg_m = pd.Series(_G_log(s_neg_m.values, gamma_neg, c_neg),
+                    index=s_neg_m.index, name='G_neg')
+D_dir_lstar = (G_neg_m > 0.5).astype(int)
+
+print(f"""
+      Transición común estimada sobre RV⁻ (ESG Q1/Q5/L-S):
+      γ_T = {gamma_neg:.2f} | c = {c_neg:+.3f} → percentil {float((s_neg_m < c_neg).mean())*100:.0f} del downside
+      Meses con G>0.5 (descriptivo): {int(D_dir_lstar.sum())} de {len(D_dir_lstar)}""")
+
+
+def kappa_a5(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    po = (a == b).mean()
+    pe = (a == 1).mean() * (b == 1).mean() + (a == 0).mean() * (b == 0).mean()
+    return (po - pe) / (1 - pe) if pe < 1 else np.nan
+
+
+print(f"""
+  CONCORDANCIA CON EL RÉGIMEN MS (kappa; entre paréntesis, versión SIN dirección):
+    MS vs GARCH-direccional: {kappa_a5(df_diag.D_MS, D_dir_garch.reindex(idx_m)):.3f}  (sin dirección: {kappa_a5(df_diag.D_MS, df_diag.D_G):.3f})
+    MS vs LSTAR-bajista:     {kappa_a5(df_diag.D_MS, D_dir_lstar.reindex(idx_m)):.3f}  (sin dirección: {kappa_a5(df_diag.D_MS, df_diag.D_L):.3f})
+  Si la kappa SUBE al incorporar dirección, el MS estaba capturando un
+  régimen BAJISTA, no solo volátil — confirma el diagnóstico.""")
+
+# ==============================================================================
+# SECCIÓN 3: CAPM CONDICIONAL CON LOS MODELOS DIRECCIONALES
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 3: δ bajo los modelos direccionales vs MS (Etapa 2 idéntica, NW3)")
+print("─" * 80)
+
+df_reg_a5 = pd.DataFrame({
+    'Date': idx_m,
+    'D_MS': df_diag.D_MS.values,
+    'D_DIR_G': D_dir_garch.reindex(idx_m).values,
+    'G_NEG': G_neg_m.reindex(idx_m).values,
+    'D_DIR_L': D_dir_lstar.reindex(idx_m).values,
+})
+
+
+def _capm_inter(y, rm, w):
+    """CAPM condicional con interacción w (dummy o G continua)."""
+    if np.ptp(w) == 0:
+        return None
+    X = sm.add_constant(np.column_stack([w, rm, w * rm]))
+    m = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+    return {'delta': m.params[3], 'se': m.bse[3],
+            't': m.tvalues[3], 'p': m.pvalues[3]}
+
+
+def _decision(r):
+    if r is None:
+        return 'n/d'
+    if r['p'] < 0.05:
+        return 'refugio' if r['delta'] < 0 else 'amplifica'
+    return 'sin cambio'
+
+
+resultados_a5 = {}
+datos_cache_a5 = {}
+for score in SCORES_A5:
+    for cartera in CARTERAS_A5:
+        df_p = ports_raw[score].merge(
+            df_factors_4f[['YearMonth', 'Rm_Rf']], on='YearMonth', how='inner')
+        df_p['Date'] = pd.to_datetime(df_p['Date'])
+        df_p = df_p.merge(df_reg_a5, on='Date', how='inner')
+        ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+        d = df_p[['Date', ret_col, 'Rm_Rf', 'D_MS', 'D_DIR_G', 'G_NEG',
+                  'D_DIR_L']].dropna().sort_values('Date').rename(
+            columns={ret_col: 'Y'})
+        datos_cache_a5[(score, cartera)] = d
+        y, rm = d['Y'].values, d['Rm_Rf'].values
+        resultados_a5[(score, cartera)] = {
+            'MS':      _capm_inter(y, rm, d['D_MS'].values.astype(float)),
+            'GARCHd':  _capm_inter(y, rm, d['D_DIR_G'].values.astype(float)),
+            'LSTARn':  _capm_inter(y, rm, d['G_NEG'].values),
+            'n': len(d),
+        }
+
+print(f"\n  {'Score':<15} {'Cart.':<7} {'δ_MS':>7} {'p':>7} {'':>3} "
+      f"{'δ_GARCHdir':>10} {'p':>7} {'':>3} {'δ_LSTARneg':>10} {'p':>7} {'':>3}  Decisión")
+print(f"  {'─'*104}")
+tabla_a5 = []
+for score in SCORES_A5:
+    for cartera in CARTERAS_A5:
+        rr = resultados_a5[(score, cartera)]
+        decs = [_decision(rr[m]) for m in ['MS', 'GARCHd', 'LSTARn']]
+        concuerda = '✅ ' + decs[0] if len(set(decs)) == 1 else '⚠️  ' + '/'.join(decs)
+        fila = {'score': score, 'cartera': cartera}
+        for m in ['MS', 'GARCHd', 'LSTARn']:
+            fila[f'delta_{m}'] = rr[m]['delta'] if rr[m] else np.nan
+            fila[f'p_{m}'] = rr[m]['p'] if rr[m] else np.nan
+            fila[f'se_{m}'] = rr[m]['se'] if rr[m] else np.nan
+        tabla_a5.append(fila)
+        print(f"  {LABELS_A5[score]:<15} {cartera:<7} "
+              f"{rr['MS']['delta']:>7.3f} {rr['MS']['p']:>7.4f} {_stars_a5(rr['MS']['p']):>3} "
+              f"{rr['GARCHd']['delta']:>10.3f} {rr['GARCHd']['p']:>7.4f} {_stars_a5(rr['GARCHd']['p']):>3} "
+              f"{rr['LSTARn']['delta']:>10.3f} {rr['LSTARn']['p']:>7.4f} {_stars_a5(rr['LSTARn']['p']):>3}  {concuerda}")
+
+df_tabla_a5 = pd.DataFrame(tabla_a5)
+n_conc_a5 = sum(1 for f in tabla_a5 if len(set(
+    _decision(resultados_a5[(f['score'], f['cartera'])][m])
+    for m in ['MS', 'GARCHd', 'LSTARn'])) == 1)
+print(f"\n  Decisión idéntica en los 3 modelos: {n_conc_a5} de {len(tabla_a5)} carteras "
+      f"(en A4, sin dirección: 3 de 12)")
+
+# ==============================================================================
+# SECCIÓN 4: BOOTSTRAP PAREADO — H0: δ_direccional = δ_MS (ESG compuesto)
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print(f"SECCIÓN 4: Bootstrap pareado por bloques (B = {B_BOOT_A5}, bloque = {BLOQUE_A5} m) — ESG")
+print("─" * 80)
+
+
+def _delta_r(y, rm, w):
+    if np.ptp(w) == 0:
+        return np.nan
+    X = np.column_stack([np.ones(len(y)), w, rm, w * rm])
+    return np.linalg.lstsq(X, y, rcond=None)[0][3]
+
+
+def _idx_bloques_a5(n, largo, rng):
+    n_b = int(np.ceil(n / largo))
+    starts = rng.integers(0, n - largo + 1, size=n_b)
+    return np.concatenate([np.arange(s, s + largo) for s in starts])[:n]
+
+
+print(f"\n  {'Cart.':<7} {'Diferencia':<14} {'Media':>7} {'IC 2.5%':>8} "
+      f"{'IC 97.5%':>9} {'p_boot':>7}  ¿δ igual?")
+print(f"  {'─'*70}")
+boot_a5 = []
+for cartera in CARTERAS_A5:
+    d = datos_cache_a5[('ESG_Score', cartera)]
+    y, rm = d['Y'].values, d['Rm_Rf'].values
+    wms = d['D_MS'].values.astype(float)
+    wg  = d['D_DIR_G'].values.astype(float)
+    wl  = d['G_NEG'].values
+    n = len(y)
+    difs = {'GARCHdir−MS': [], 'LSTARneg−MS': []}
+    for _ in range(B_BOOT_A5):
+        ii = _idx_bloques_a5(n, BLOQUE_A5, rng_a5)
+        d_ms = _delta_r(y[ii], rm[ii], wms[ii])
+        if np.isnan(d_ms):
+            continue
+        d_g = _delta_r(y[ii], rm[ii], wg[ii])
+        d_l = _delta_r(y[ii], rm[ii], wl[ii])
+        if not np.isnan(d_g): difs['GARCHdir−MS'].append(d_g - d_ms)
+        if not np.isnan(d_l): difs['LSTARneg−MS'].append(d_l - d_ms)
+    for et, dd in difs.items():
+        dd = np.array(dd)
+        lo, hi = np.percentile(dd, [2.5, 97.5])
+        p_b = 2 * min((dd <= 0).mean(), (dd >= 0).mean())
+        boot_a5.append({'cartera': cartera, 'dif': et, 'media': dd.mean(),
+                        'ic_lo': lo, 'ic_hi': hi, 'p_boot': p_b,
+                        'contiene_0': lo <= 0 <= hi})
+        igual = '✅ sí (IC∋0)' if lo <= 0 <= hi else '❌ NO'
+        print(f"  {cartera:<7} {et:<14} {dd.mean():>7.3f} {lo:>8.3f} "
+              f"{hi:>9.3f} {p_b:>7.3f}  {igual}")
+
+df_boot_a5 = pd.DataFrame(boot_a5)
+
+# ==============================================================================
+# SECCIÓN 5: GRÁFICO Y EXPORTACIÓN
+# ==============================================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+fig.suptitle('H3 Robustez — Diagnóstico direccional: crisis bajista vs alta volatilidad',
+             fontsize=12, fontweight='bold')
+
+ax = axes[0]
+mask_cc = (df_diag.D_MS == 1) & (df_diag.D_G == 1)
+mask_gg = (df_diag.D_MS == 0) & (df_diag.D_G == 1)
+mask_mm = (df_diag.D_MS == 1) & (df_diag.D_G == 0)
+mask_00 = (df_diag.D_MS == 0) & (df_diag.D_G == 0)
+ax.scatter(df_diag.loc[mask_00, 'SIG_G'] * np.sqrt(252),
+           df_diag.loc[mask_00, 'Rm_mes'] * 100, s=22, color='#bdbdbd',
+           alpha=0.6, label='ambos calma')
+ax.scatter(df_diag.loc[mask_cc, 'SIG_G'] * np.sqrt(252),
+           df_diag.loc[mask_cc, 'Rm_mes'] * 100, s=55, color='#d73027',
+           label='ambos crisis')
+ax.scatter(df_diag.loc[mask_gg, 'SIG_G'] * np.sqrt(252),
+           df_diag.loc[mask_gg, 'Rm_mes'] * 100, s=65, color='#fdae61',
+           marker='^', edgecolor='black', linewidth=0.5,
+           label='solo GARCH (¿rebotes?)')
+ax.scatter(df_diag.loc[mask_mm, 'SIG_G'] * np.sqrt(252),
+           df_diag.loc[mask_mm, 'Rm_mes'] * 100, s=65, color='#2c3e50',
+           marker='v', label='solo MS')
+ax.axhline(0, color='black', lw=0.8)
+ax.set_xlabel('σ condicional GARCH del mes (anualizada, %)')
+ax.set_ylabel('Retorno del mercado en el mes (%)')
+ax.set_title('Meses discordantes: el cuadrante superior derecho\n'
+             'son rebotes con alta volatilidad', fontsize=10)
+ax.legend(fontsize=8.5)
+ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+x = np.arange(len(CARTERAS_A5))
+colores5 = {'MS': '#2c3e50', 'GARCHd': '#1a9641', 'LSTARn': '#d73027'}
+etiquetas5 = {'MS': 'MS (3.4)', 'GARCHd': 'GARCH direccional',
+              'LSTARn': 'LSTAR semivol. negativa'}
+for j, m in enumerate(['MS', 'GARCHd', 'LSTARn']):
+    dlt = [resultados_a5[('ESG_Score', c)][m]['delta'] for c in CARTERAS_A5]
+    se  = [resultados_a5[('ESG_Score', c)][m]['se'] for c in CARTERAS_A5]
+    ax.errorbar(x + (j - 1) * 0.15, dlt, yerr=1.96 * np.array(se), fmt='o',
+                capsize=4, markersize=7, color=colores5[m], label=etiquetas5[m])
+ax.axhline(0, color='black', lw=0.8)
+ax.set_xticks(x)
+ax.set_xticklabels(CARTERAS_A5)
+ax.set_ylabel('δ = Δβ (crisis − calma)')
+ax.set_title('δ ± IC 95% — ESG Compuesto\nmodelos DIRECCIONALES vs MS', fontsize=10)
+ax.legend(fontsize=8.5)
+ax.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+ruta = f'{RUTA_A5}/a5_direccional.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"\n   ✅ Gráfico guardado: {ruta}")
+
+disc_out = disc.copy()
+disc_out.index.name = 'Mes'
+for nombre, df_out in [('a5_meses_discordantes.csv', disc_out.reset_index()),
+                       ('a5_tabla_delta_direccional.csv', df_tabla_a5),
+                       ('a5_bootstrap_direccional.csv', df_boot_a5)]:
+    df_out.to_csv(f'{RUTA_A5}/{nombre}', index=False)
+    print(f"   ✅ CSV guardado: {RUTA_A5}/{nombre}")
+
+# ==============================================================================
+# SECCIÓN 6: VEREDICTO — ¿SE RESCATA EL HALLAZGO ESPECULAR?
+# ==============================================================================
+
+print("\n" + "=" * 80)
+print("SECCIÓN 6: VEREDICTO — ¿LA PROTECCIÓN RELATIVA DEL ESG ES UN FENÓMENO BAJISTA?")
+print("=" * 80)
+
+r_esg = resultados_a5[('ESG_Score', 'Q1')], resultados_a5[('ESG_Score', 'Q5')]
+q1, q5 = r_esg
+
+esp_ms = (_decision(q5['MS']) == 'amplifica' and _decision(q1['MS']) == 'sin cambio')
+esp_g  = (_decision(q5['GARCHd']) == 'amplifica' and _decision(q1['GARCHd']) == 'sin cambio')
+esp_l  = (_decision(q5['LSTARn']) == 'amplifica' and _decision(q1['LSTARn']) == 'sin cambio')
+
+# Diagnóstico direccional: ¿los meses solo-alternativos eran rebotes?
+diag_ok = (len(solo_g) > 0 and solo_g['Rm_mes'].mean() > 0 and
+           ambos['Rm_mes'].mean() < 0)
+
+print(f"""
+  Diagnóstico (Sección 1): meses 'solo GARCH' con Rm medio {'POSITIVO' if len(solo_g) and solo_g['Rm_mes'].mean() > 0 else 'negativo'} """
+      f"""({solo_g['Rm_mes'].mean()*100 if len(solo_g) else float('nan'):+.2f}%/mes) vs 'ambos crisis' {ambos['Rm_mes'].mean()*100:+.2f}%/mes → {'✅ rebotes confirmados' if diag_ok else '❌ no concluyente'}
+
+  Patrón especular (Q5 amplifica significativo ∧ Q1 sin cambio) — ESG Compuesto:
+    MS (3.4):                {'✅ SÍ' if esp_ms else '❌ NO'}   (δ_Q5 = {q5['MS']['delta']:+.3f}, p = {q5['MS']['p']:.4f} | δ_Q1 = {q1['MS']['delta']:+.3f}, p = {q1['MS']['p']:.4f})
+    GARCH direccional:       {'✅ SÍ' if esp_g else '❌ NO'}   (δ_Q5 = {q5['GARCHd']['delta']:+.3f}, p = {q5['GARCHd']['p']:.4f} | δ_Q1 = {q1['GARCHd']['delta']:+.3f}, p = {q1['GARCHd']['p']:.4f})
+    LSTAR semivol. negativa: {'✅ SÍ' if esp_l else '❌ NO'}   (δ_Q5 = {q5['LSTARn']['delta']:+.3f}, p = {q5['LSTARn']['p']:.4f} | δ_Q1 = {q1['LSTARn']['delta']:+.3f}, p = {q1['LSTARn']['p']:.4f})
+""")
+
+if esp_ms and esp_g and esp_l:
+    print("""  ═══════════════════════════════════════════════════════════════════════
+  ✅ VEREDICTO: HALLAZGO ESPECULAR RESCATADO Y PRECISADO.
+  ═══════════════════════════════════════════════════════════════════════
+  Los tres modelos coinciden cuando 'crisis' se define como régimen
+  BAJISTA (alta volatilidad CON caídas): las low-ESG amplifican su beta
+  y las high-ESG permanecen estables. La divergencia del A4 se explica:
+  los modelos sin dirección etiquetaban como crisis los rebotes de alta
+  volatilidad. REDACCIÓN: (a) mantener MS-CAPM como principal (su media
+  cambiante capta el régimen bajista, que es el concepto de crisis de H3);
+  (b) reformular el hallazgo como 'amplificación del riesgo de las
+  low-ESG en MERCADOS BAJISTAS'; (c) anexo con A2-A5: la distinción
+  bajista vs volátil es una contribución, no una debilidad.""")
+elif esp_ms and (esp_g or esp_l):
+    cual = 'GARCH direccional' if esp_g else 'LSTAR semivol. negativa'
+    print(f"""  ═══════════════════════════════════════════════════════════════════════
+  🟡 VEREDICTO: RESCATE PARCIAL — el patrón especular se reproduce en
+     {cual}, pero no en el otro modelo direccional.
+  ═══════════════════════════════════════════════════════════════════════
+  REDACCIÓN: mantener MS-CAPM como principal; presentar el hallazgo
+  especular como 'evidencia condicionada a la definición bajista de
+  crisis, corroborada parcialmente'; reportar la tabla completa en el
+  anexo y discutir la divergencia restante con honestidad.""")
+else:
+    print("""  ═══════════════════════════════════════════════════════════════════════
+  🔴 VEREDICTO: EL HALLAZGO ESPECULAR NO SE RESCATA.
+  ═══════════════════════════════════════════════════════════════════════
+  Ni siquiera las versiones direccionales reproducen el patrón del MS →
+  el hallazgo depende específicamente de la clasificación markoviana.
+  REDACCIÓN: (a) la conclusión formal de H3 (el ESG NO es refugio) se
+  mantiene — es robusta en TODOS los modelos probados (A4); (b) degradar
+  el hallazgo especular a 'evidencia sugestiva no robusta a la definición
+  de régimen' y retirar su papel de 'mecanismo de H1' en la síntesis;
+  (c) documentar A2-A5 como anexo de robustez que responde al tribunal.""")
+
+print(f"\nFin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)

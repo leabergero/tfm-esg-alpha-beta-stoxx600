@@ -9,15 +9,30 @@ Documentación de la estructura de datos del proyecto.
 ```
 data/
 ├── raw_indices/         # Índices públicos y tasas de interés
-│   ├── stoxx600_retornos_diarios_2015_2025 (STOXXR).csv
-│   └── euribor_tasas_diarias_2014_2025_corregido.csv
-├── processed/           # Datos consolidados (requiere ejecución)
+│   ├── stoxx600_retornos_diarios_2015_2025 (STOXXR).csv   # Net Return — ACTIVO
+│   ├── stoxx600_retornos_diarios_2015_2025 (SXXGR).csv    # Gross Return (sensibilidad)
+│   ├── stoxx600_retornos_diarios_2015_2025.csv            # Price Return (Anexo A1)
+│   ├── euribor_tasas_diarias_2014_2025_corregido.csv      # Rf — ACTIVO
+│   └── euribor_tasas_diarias_2014_2025.csv                # Rf original (trazabilidad)
+├── raw/                 # Descargas anuales crudas de Refinitiv (2015-2025)
+│   ├── stoxx600_DEFENSA_YYYY.csv            # Panel diario base por año
+│   ├── stoxx600_PTB_CONSOLIDADO_YYYY.csv    # Price-to-Book consolidado por año
+│   ├── stoxx600_PTB_y_ROAS_diario_YYYY.csv  # PTB y ROA diarios por año
+│   └── RICS_FALTANTES_PTB_ROA.csv           # RICs con huecos de PTB/ROA
+├── consolidados/        # CONSOLIDADO_2015.csv ... CONSOLIDADO_2025.csv
+│                        # → insumo directo del notebook (Script 2)
+├── processed/           # Datos consolidados en pickle (requiere ejecución)
 │   ├── df_all.pkl
 │   ├── consolidados.pkl
 │   ├── df_monthly_raw.pkl
 │   └── df_annual_raw.pkl
 └── README.md           # Este archivo
 ```
+
+> **Reproducción en Colab:** el notebook espera los archivos en
+> `MyDrive/TFM_STOXX600/` (los `CONSOLIDADO_YYYY.csv` en la carpeta que lee el
+> Script 2). Copia el contenido de `data/` a tu Google Drive respetando los
+> nombres, o ajusta las rutas de las primeras celdas del notebook.
 
 ---
 
@@ -259,5 +274,5 @@ python "scripts/2. Carga Consolidacion y Analisis.py"
 
 ---
 
-**Última actualización:** 16 de junio de 2026  
-**Estado:** Datos consolidados validados y auditados
+**Última actualización:** 14 de julio de 2026  
+**Estado:** Bases de datos completas publicadas (raw + consolidados) — validadas y auditadas

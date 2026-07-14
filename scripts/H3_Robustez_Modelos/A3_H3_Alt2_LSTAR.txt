@@ -1,0 +1,387 @@
+# ==============================================================================
+# SCRIPT A3 — ROBUSTEZ H3 (MODELO ALTERNATIVO 2): CAPM DE TRANSICIÓN SUAVE (LSTAR)
+# ==============================================================================
+#
+# MOTIVACIÓN (observación del tribunal, Hito 4): el MS(2) produce una
+# clasificación binaria desbalanceada (18/120 meses en crisis). El LSTAR
+# ELIMINA la clasificación binaria: no existe dummy, por lo que la crítica
+# de desbalance no aplica POR CONSTRUCCIÓN — todos los meses contribuyen
+# a identificar el efecto, ponderados por su grado de estrés.
+#
+# MODELO (Teräsvirta 1994; Lin & Teräsvirta 1994):
+#   R_pt − R_ft = α + γ·G(s_t) + β·(Rm_Rf)_t + δ·G(s_t)·(Rm_Rf)_t + ε_pt
+#   G(s_t) = 1 / (1 + exp[−γ_T·(s_t − c)])     (función logística)
+#
+#   s_t  = volatilidad realizada mensual del mercado (log, estandarizada),
+#          calculada desde los retornos DIARIOS: RV_m = sqrt(Σ r²_d).
+#          Es una medida LIBRE DE MODELO → A3 es independiente de A2.
+#   γ_T  = suavidad de la transición (γ_T→∞ ≈ umbral discreto)
+#   c    = localización de la transición
+#
+#   β(s_t) = β + δ·G(s_t): la beta TRANSITA continuamente entre el estado
+#   de calma extrema (G=0) y el de crisis extrema (G=1).
+#   δ = β_crisis − β_calma → directamente comparable con el δ del MS-CAPM.
+#
+# DISEÑO: (γ_T, c) se estiman COMUNES a las carteras (transición del
+# MERCADO, análoga al régimen común del diseño en 2 etapas del Script 3.4),
+# minimizando la SSR concentrada ponderada de las carteras ESG Q1/Q5/L-S.
+# Con (γ_T, c) fijos, el modelo es lineal → OLS + Newey-West por cartera.
+# Sensibilidad: (γ_T, c) libres por ecuación (Sección 5).
+#
+# JUSTIFICACIÓN ESTADÍSTICA PREVIA: test de linealidad LM de Teräsvirta
+# (H0: modelo lineal vs H1: transición suave en s_t) — Sección 2.
+#
+# REQUIERE EN MEMORIA (ejecutar ANTES el pipeline completo hasta Script 3.4):
+#   rm_diario (3.4) + ports_raw (3.2) + df_factors_4f (3.1)
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from scipy import stats
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("SCRIPT A3: H3 ROBUSTEZ — ALTERNATIVA 2: CAPM DE TRANSICIÓN SUAVE (LSTAR)")
+print("=" * 80)
+print(f"\nInicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for var, nombre in [('rm_diario', 'Script 3.4'),
+                    ('ports_raw', 'Script 3.2'),
+                    ('df_factors_4f', 'Script 3.1')]:
+    if var not in dir():
+        print(f"❌ '{var}' no está en memoria. Ejecuta {nombre} primero.")
+        raise SystemExit
+
+if 'STOXX_VERSION' not in dir():
+    STOXX_VERSION = 'versión no identificada'
+
+SCORES_A3 = ['ESG_Score', 'E_Score', 'S_Score', 'G_Score']
+LABELS_A3 = {'ESG_Score': 'ESG Compuesto', 'E_Score': 'Pilar E',
+             'S_Score': 'Pilar S', 'G_Score': 'Pilar G'}
+CARTERAS_A3 = ['Q1', 'Q5', 'Q1-Q5']
+
+np.random.seed(42)
+
+
+def _stars_a3(p):
+    if   p < 0.01: return '***'
+    elif p < 0.05: return '**'
+    elif p < 0.10: return '*'
+    else:          return ''
+
+# ==============================================================================
+# SECCIÓN 1: VARIABLE DE TRANSICIÓN — VOLATILIDAD REALIZADA MENSUAL
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 1: Variable de transición s_t (volatilidad realizada mensual)")
+print("─" * 80)
+
+rv_m = rm_diario.groupby(rm_diario.index.to_period('M')).apply(
+    lambda x: np.sqrt((x ** 2).sum()))
+fechas_m_l = rv_m.index.to_timestamp()
+rv_m = pd.Series(rv_m.values, index=fechas_m_l, name='RV_m')          # vol. mensual (decimal)
+
+log_rv = np.log(rv_m)
+s_lstar_m = (log_rv - log_rv.mean()) / log_rv.std()                    # estandarizada
+s_lstar_m.name = 's_t'
+
+print(f"""
+  RV mensual (√Σr²_d, desde {len(rm_diario):,} retornos diarios): {len(rv_m)} meses
+    mín = {rv_m.min()*100:.2f}%/mes | mediana = {rv_m.median()*100:.2f}%/mes | máx = {rv_m.max()*100:.2f}%/mes
+  s_t = log(RV) estandarizada → media 0, desv. 1 (asimetría {stats.skew(s_lstar_m):.2f})
+""")
+
+# ==============================================================================
+# SECCIÓN 2: TEST DE LINEALIDAD DE TERÄSVIRTA (¿SE JUSTIFICA LA TRANSICIÓN?)
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 2: Test LM de linealidad (H0: CAPM lineal | H1: transición en s_t)")
+print("─" * 80)
+
+df_s = pd.DataFrame({'Date': s_lstar_m.index, 's_t': s_lstar_m.values})
+
+
+def _datos_cartera(score, cartera):
+    """Serie mensual alineada (Y exceso, Rm_Rf, s_t) para una cartera."""
+    df_p = ports_raw[score].merge(
+        df_factors_4f[['YearMonth', 'Rm_Rf']], on='YearMonth', how='inner')
+    df_p['Date'] = pd.to_datetime(df_p['Date'])
+    df_p = df_p.merge(df_s, on='Date', how='inner')
+    ret_col = 'EX_LS' if cartera == 'Q1-Q5' else f'EX_{cartera}'
+    d = df_p[['Date', ret_col, 'Rm_Rf', 's_t']].dropna().sort_values('Date')
+    return d.rename(columns={ret_col: 'Y'})
+
+
+def test_terasvirta(y, rm, s):
+    """LM = n·R² de la regresión auxiliar de los residuos lineales
+    sobre [1, Rm] ⊗ [1, s, s², s³] (6 regresores añadidos) ~ χ²(6)."""
+    u = sm.OLS(y, sm.add_constant(rm)).fit().resid
+    Z = np.column_stack([np.ones(len(y)), rm,
+                         s, s**2, s**3, rm*s, rm*s**2, rm*s**3])
+    r2 = sm.OLS(u, Z).fit().rsquared
+    LM = len(y) * r2
+    return LM, 1 - stats.chi2.cdf(LM, df=6)
+
+
+print(f"\n  {'Score':<15} {'Cartera':<8} {'n':>4} {'LM':>8} {'p':>8} {'Sig':>4}  Lectura")
+print(f"  {'─'*68}")
+tests_linealidad = {}
+for score in SCORES_A3:
+    for cartera in CARTERAS_A3:
+        d = _datos_cartera(score, cartera)
+        LM, p = test_terasvirta(d['Y'].values, d['Rm_Rf'].values, d['s_t'].values)
+        tests_linealidad[(score, cartera)] = (LM, p)
+        lect = 'rechaza linealidad' if p < 0.10 else 'no rechaza'
+        print(f"  {LABELS_A3[score]:<15} {cartera:<8} {len(d):>4} {LM:>8.2f} "
+              f"{p:>8.4f} {_stars_a3(p):>4}  {lect}")
+
+print("""
+  Nota: el rechazo de H0 justifica modelar la beta como función de la
+  volatilidad; si no se rechaza en alguna cartera, el LSTAR sigue siendo
+  válido como análisis de robustez (anida el caso lineal con δ=0).""")
+
+# ==============================================================================
+# SECCIÓN 3: ESTIMACIÓN DE LA TRANSICIÓN COMÚN (γ_T, c)
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 3: Estimación (γ_T, c) — transición común del mercado")
+print("           (SSR concentrada ponderada: ESG Q1, Q5 y L-S)")
+print("─" * 80)
+
+
+def G_logistica(s, gamma_t, c):
+    z = np.clip(-gamma_t * (s - c), -35, 35)
+    return 1.0 / (1.0 + np.exp(z))
+
+
+def _ssr_concentrada(y, rm, s, gamma_t, c):
+    """Para (γ_T, c) fijos el modelo es lineal → SSR del OLS."""
+    G = G_logistica(s, gamma_t, c)
+    X = np.column_stack([np.ones(len(y)), G, rm, G * rm])
+    coef = np.linalg.lstsq(X, y, rcond=None)[0]
+    u = y - X @ coef
+    return float(u @ u)
+
+
+# Ecuaciones que identifican la transición (ESG compuesto) y sus pesos
+eqs_esg = {c: _datos_cartera('ESG_Score', c) for c in CARTERAS_A3}
+pesos = {}
+for c, d in eqs_esg.items():
+    ssr_lineal = float(sm.OLS(d['Y'].values,
+                              sm.add_constant(d['Rm_Rf'].values)).fit().ssr)
+    pesos[c] = 1.0 / ssr_lineal   # iguala la contribución relativa de cada ecuación
+
+
+def objetivo(params):
+    log_g, c = params
+    gamma_t = np.exp(log_g)
+    if not (0.05 <= gamma_t <= 500) or not (-2.5 <= c <= 2.5):
+        return 1e12
+    return sum(pesos[k] * _ssr_concentrada(d['Y'].values, d['Rm_Rf'].values,
+                                           d['s_t'].values, gamma_t, c)
+               for k, d in eqs_esg.items())
+
+
+# Búsqueda en rejilla + refinamiento Nelder-Mead
+grid_c = np.quantile(s_lstar_m.values, np.linspace(0.15, 0.90, 16))
+grid_g = np.geomspace(0.5, 60, 12)
+mejor = (np.inf, None)
+for g in grid_g:
+    for c in grid_c:
+        val = objetivo((np.log(g), c))
+        if val < mejor[0]:
+            mejor = (val, (np.log(g), c))
+
+opt = minimize(objetivo, x0=np.array(mejor[1]), method='Nelder-Mead',
+               options={'xatol': 1e-4, 'fatol': 1e-10, 'maxiter': 2000})
+gamma_lstar = float(np.exp(opt.x[0]))
+c_lstar = float(opt.x[1])
+perc_c = float((s_lstar_m < c_lstar).mean())
+
+G_lstar_m = pd.Series(G_logistica(s_lstar_m.values, gamma_lstar, c_lstar),
+                      index=s_lstar_m.index, name='G_t')
+D_crisis_lstar = (G_lstar_m > 0.5).astype(int)
+D_crisis_lstar.name = 'D_crisis_lstar'
+
+print(f"""
+  TRANSICIÓN COMÚN ESTIMADA:
+    γ_T = {gamma_lstar:.2f}  ({'transición abrupta (≈umbral)' if gamma_lstar > 10 else 'transición suave'})
+    c   = {c_lstar:+.3f} (en s estandarizada) → percentil {perc_c*100:.0f} de la vol. realizada
+    G_t: mín = {G_lstar_m.min():.3f} | media = {G_lstar_m.mean():.3f} | máx = {G_lstar_m.max():.3f}
+    Meses con G_t > 0.5 (clasificación implícita, solo descriptiva): {int(D_crisis_lstar.sum())} de {len(D_crisis_lstar)}
+    Masa efectiva del 'régimen' de estrés: ΣG_t = {G_lstar_m.sum():.1f} meses-equivalentes
+    (con transición suave TODOS los meses aportan información → sin desbalance)
+""")
+
+# ==============================================================================
+# SECCIÓN 4: CAPM LSTAR POR CARTERA (G_t COMÚN, OLS + NEWEY-WEST)
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 4: R_p−R_f = α + γ·G_t + β·Rm_Rf + δ·(G_t×Rm_Rf) | NW(3)")
+print("─" * 80)
+
+
+def capm_lstar(score, cartera, gamma_t=None, c=None):
+    gamma_t = gamma_lstar if gamma_t is None else gamma_t
+    c = c_lstar if c is None else c
+    d = _datos_cartera(score, cartera)
+    if len(d) < 24:
+        return None
+    G = G_logistica(d['s_t'].values, gamma_t, c)
+    X = sm.add_constant(np.column_stack([G, d['Rm_Rf'].values,
+                                         G * d['Rm_Rf'].values]))
+    Y = d['Y'].values
+    m_nw = sm.OLS(Y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+    m_ols = sm.OLS(Y, X).fit()
+    beta, delta = m_nw.params[2], m_nw.params[3]
+    rango_G = G.max() - G.min()
+    return {'score': score, 'cartera': cartera, 'n': len(d),
+            'beta_calma': beta,                       # β en G=0
+            'beta_crisis': beta + delta,              # β en G=1
+            'delta': delta, 't_delta': m_nw.tvalues[3], 'p_delta': m_nw.pvalues[3],
+            'se_delta': m_nw.bse[3], 'wald': m_nw.tvalues[3]**2,
+            'delta_efectivo': delta * rango_G,        # Δβ observado en muestra
+            'R2': m_ols.rsquared, 'ssr': m_ols.ssr, 'G': G,
+            'modelo_nw': m_nw, 'datos': d}
+
+
+resultados_h3_lstar = {}
+for score in SCORES_A3:
+    for cartera in CARTERAS_A3:
+        r = capm_lstar(score, cartera)
+        if r is not None:
+            resultados_h3_lstar[(score, cartera)] = r
+
+print(f"\n  ✅ Modelos estimados: {len(resultados_h3_lstar)} / {len(SCORES_A3)*len(CARTERAS_A3)}")
+print("""
+  Inferencia condicional a (γ̂_T, ĉ) — práctica estándar en la literatura
+  STR (Teräsvirta 1994). δ = β(G=1) − β(G=0); 'δ efectivo' = δ·(G_máx−G_mín)
+  es el cambio de beta realmente observado dentro de la muestra.
+""")
+
+print("═" * 80)
+print("TABLA A3 — CAPM DE TRANSICIÓN SUAVE (Wald: H0 δ=0)")
+print("═" * 80)
+for score in SCORES_A3:
+    print(f"\n  {LABELS_A3[score]}")
+    print(f"  {'Cartera':<8} {'β(G=0)':>8} {'β(G=1)':>8} {'Δβ (δ)':>8} {'δ efect.':>9} "
+          f"{'t(δ)':>7} {'p(δ)':>8} {'Sig':>4} {'R²':>6}")
+    print(f"  {'─'*76}")
+    for cartera in CARTERAS_A3:
+        r = resultados_h3_lstar.get((score, cartera))
+        if r is None:
+            continue
+        print(f"  {cartera:<8} {r['beta_calma']:>8.3f} {r['beta_crisis']:>8.3f} "
+              f"{r['delta']:>8.3f} {r['delta_efectivo']:>9.3f} {r['t_delta']:>7.2f} "
+              f"{r['p_delta']:>8.4f} {_stars_a3(r['p_delta']):>4} {r['R2']:>6.3f}")
+
+# ==============================================================================
+# SECCIÓN 5: SENSIBILIDAD — (γ_T, c) LIBRES EN LA ECUACIÓN CENTRAL (ESG Q5)
+# ==============================================================================
+
+print("\n" + "─" * 80)
+print("SECCIÓN 5: Sensibilidad — transición libre vs común (ESG Q5, hallazgo central)")
+print("─" * 80)
+
+d_q5 = eqs_esg['Q5']
+mejor_q5 = (np.inf, None)
+for g in grid_g:
+    for c in grid_c:
+        val = _ssr_concentrada(d_q5['Y'].values, d_q5['Rm_Rf'].values,
+                               d_q5['s_t'].values, g, c)
+        if val < mejor_q5[0]:
+            mejor_q5 = (val, (np.log(g), c))
+
+opt_q5 = minimize(
+    lambda p: (_ssr_concentrada(d_q5['Y'].values, d_q5['Rm_Rf'].values,
+                                d_q5['s_t'].values, np.exp(p[0]), p[1])
+               if (0.05 <= np.exp(p[0]) <= 500 and -2.5 <= p[1] <= 2.5) else 1e12),
+    x0=np.array(mejor_q5[1]), method='Nelder-Mead',
+    options={'xatol': 1e-4, 'fatol': 1e-12, 'maxiter': 2000})
+g_q5, c_q5 = float(np.exp(opt_q5.x[0])), float(opt_q5.x[1])
+r_q5_libre = capm_lstar('ESG_Score', 'Q5', gamma_t=g_q5, c=c_q5)
+r_q5_comun = resultados_h3_lstar[('ESG_Score', 'Q5')]
+
+print(f"""
+  {'':>22} {'γ_T':>8} {'c':>8} {'δ':>8} {'p(δ)':>8}
+  {'─'*60}
+  {'Transición COMÚN':>22} {gamma_lstar:>8.2f} {c_lstar:>+8.3f} {r_q5_comun['delta']:>8.3f} {r_q5_comun['p_delta']:>8.4f}
+  {'Transición LIBRE Q5':>22} {g_q5:>8.2f} {c_q5:>+8.3f} {r_q5_libre['delta']:>8.3f} {r_q5_libre['p_delta']:>8.4f}
+
+  Si δ y su significancia son similares, la restricción de transición común
+  (necesaria para comparar Q1 vs Q5 sobre el mismo estado del mercado) es inocua.
+""")
+
+# ==============================================================================
+# SECCIÓN 6: GRÁFICOS
+# ==============================================================================
+
+print("─" * 80)
+print("SECCIÓN 6: Gráficos")
+print("─" * 80)
+
+RUTA_A3 = '/content/drive/MyDrive/TFM_STOXX600/HITO4/H3_ROBUSTEZ'
+try:
+    os.makedirs(RUTA_A3, exist_ok=True)
+except OSError:
+    RUTA_A3 = '.'
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5),
+                         gridspec_kw={'width_ratios': [1, 1.8]})
+fig.suptitle('H3 Robustez — Alternativa 2: CAPM de transición suave (LSTAR)\n'
+             f'STOXX 600 {STOXX_VERSION} — sin clasificación binaria → sin desbalance',
+             fontsize=11, fontweight='bold')
+
+ax = axes[0]
+s_grid = np.linspace(s_lstar_m.min() - 0.2, s_lstar_m.max() + 0.2, 300)
+ax.plot(s_grid, G_logistica(s_grid, gamma_lstar, c_lstar), color='#d73027', lw=2)
+ax.scatter(s_lstar_m.values, G_lstar_m.values, s=18, color='#2c3e50',
+           alpha=0.55, zorder=3, label='meses observados')
+ax.axvline(c_lstar, color='gray', ls=':', lw=1)
+ax.set_xlabel('s_t (log-vol. realizada, estandarizada)')
+ax.set_ylabel('G(s_t)')
+ax.set_title(f'Función de transición  (γ_T={gamma_lstar:.1f}, c={c_lstar:+.2f})',
+             fontsize=10)
+ax.legend(fontsize=8.5)
+ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+ax.fill_between(G_lstar_m.index, G_lstar_m.values, 0, color='#d73027', alpha=0.30)
+ax.plot(G_lstar_m.index, G_lstar_m.values, color='#d73027', lw=1.1,
+        label='G_t (LSTAR)')
+if 'prob_crisis_mkt' in dir():
+    ax.plot(prob_crisis_mkt.index, prob_crisis_mkt.values, color='#2c3e50',
+            lw=1.1, ls='--', label='P(crisis) mensual MS (Script 3.4)')
+ax.axhline(0.5, color='black', lw=0.7, ls=':')
+ax.set_ylabel('Intensidad de crisis')
+ax.set_ylim([0, 1.02])
+ax.set_title('G_t en el tiempo vs P(crisis) del Markov-Switching', fontsize=10)
+ax.legend(fontsize=8.5)
+ax.grid(True, alpha=0.3)
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+
+plt.tight_layout()
+ruta = f'{RUTA_A3}/a3_lstar_transicion.png'
+plt.savefig(ruta, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"   ✅ Guardado: {ruta}")
+
+print(f"""
+{'='*80}
+RESUMEN A3 — variables exportadas a memoria (las usa el Script A4):
+  s_lstar_m, G_lstar_m, gamma_lstar, c_lstar, D_crisis_lstar,
+  resultados_h3_lstar, tests_linealidad, G_logistica, capm_lstar
+{'='*80}
+Fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}""")

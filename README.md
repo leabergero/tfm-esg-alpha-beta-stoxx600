@@ -3,7 +3,7 @@
 **Autor:** Leandro R. Bergero  
 **Universidad:** BSM - UPF (Msc Finance & Banking)  
 **Período:** 2015-2025  
-**Última actualización:** junio 2026
+**Última actualización:** julio 2026
 
 ## 📋 Descripción
 
@@ -21,7 +21,8 @@ Este repositorio contiene el análisis completo de un Trabajo Fin de Master (TFM
 
 ### **H3: ESG en Crisis** — ¿Se amplifica el beta de empresas low-ESG en mercados bajistas?
 - Metodología: Markov-Switching CAPM (2 etapas)
-- Resultado: **HALLAZGO ESPECULAR** — Q5 (bajo ESG) amplifica beta en crisis (+0.21, p<0.01)
+- Resultado: **RECHAZADA** (el ESG alto no reduce el beta en crisis) — hallazgo especular: Q5 (bajo ESG) amplifica beta en crisis (+0.21, p<0.01), significativo solo bajo la definición de régimen MS
+- **Robustez (respuesta al tribunal):** el rechazo de H3 es robusto en 3 modelos de régimen (MS, GARCH(1,1)-umbral, LSTAR); el hallazgo especular queda como evidencia sugestiva dependiente de la definición de régimen. Ver `scripts/H3_Robustez_Modelos/` y las celdas finales del notebook.
 
 ## 📂 Estructura del Repositorio
 
@@ -31,11 +32,18 @@ tfm-esg-alpha-beta-stoxx600/
 ├── requirements.txt                    # Dependencias Python
 ├── LICENSE                             # Licencia CC-BY 4.0
 │
+├── thesis/
+│   ├── TFM_Bergero_Leandro_Desempeño_ESG_Stoxx600.docx   # Tesis final (Word)
+│   └── TFM_Bergero_Leandro_Desempeño_ESG_Stoxx600.pdf    # Tesis final (PDF)
+│
 ├── notebooks/
-│   ├── TFM_Impacto_del_desempeño_ESG_..._.ipynb  # Notebook Colab ejecutado (3.2 MB)
+│   ├── TFM_Impacto_del_desempeño_ESG_..._.ipynb  # Notebook Colab ejecutado (incluye robustez H3)
+│   ├── TFM Impacto ... .ipynb - Colab.pdf        # Impresión PDF del notebook ejecutado
 │   └── README.md                       # Instrucciones
 │
 ├── scripts/
+│   ├── SCRIPT DESCARGA REFINITIV.py               # Descarga de datos crudos (Refinitiv Codebook)
+│   ├── limpiar_euribor.py                         # Limpieza de la serie Euribor
 │   ├── 2. Carga Consolidacion y Analisis.py       # Script principal — data consolidada
 │   ├── 2.3_Preparacion_Datos_H1_H2_H3.txt         # Preparación para análisis
 │   ├── 3.1_Construccion_Factores_Carhart.txt      # Factores Fama-French + WML
@@ -44,6 +52,12 @@ tfm-esg-alpha-beta-stoxx600/
 │   ├── 3.4_H3_MarkovSwitching_CAPM.txt            # H3 — Markov-Switching CAPM
 │   ├── A1_Comparacion_Indices_STOXX600.txt        # Anexo A1 — PR vs NR vs GR
 │   ├── analisis_rics_sin_esg.py                   # Análisis de RICs sin data ESG
+│   ├── H3_Robustez_Modelos/                       # Robustez H3 (respuesta al tribunal)
+│   │   ├── A2_H3_Alt1_GARCH_Umbral.txt            #   Alt. 1 — GARCH(1,1)-t + umbral P75
+│   │   ├── A3_H3_Alt2_LSTAR.txt                   #   Alt. 2 — CAPM transición suave (LSTAR)
+│   │   ├── A4_H3_Contraste_Modelos.txt            #   Contraste: kappa, RCM, bootstrap, AIC
+│   │   ├── A5_H3_Direccional_Bajista.txt          #   Diagnóstico direccional/bajista
+│   │   └── README.md
 │   └── README.md                       # Documentación de scripts
 │
 ├── presentation/
@@ -52,10 +66,18 @@ tfm-esg-alpha-beta-stoxx600/
 │   └── README.md                       # Instrucciones
 │
 └── data/
-    ├── raw_indices/
-    │   ├── stoxx600_retornos_diarios_2015_2025 (STOXXR).csv
-    │   └── euribor_tasas_diarias_2014_2025_corregido.csv
-    ├── processed/                      # Datos consolidados (requiere ejecución)
+    ├── raw_indices/                    # Índices y tasa libre de riesgo
+    │   ├── stoxx600_retornos_diarios_2015_2025 (STOXXR).csv   # Net Return — ACTIVO
+    │   ├── stoxx600_retornos_diarios_2015_2025 (SXXGR).csv    # Gross Return (sensibilidad)
+    │   ├── stoxx600_retornos_diarios_2015_2025.csv            # Price Return (Anexo A1)
+    │   ├── euribor_tasas_diarias_2014_2025_corregido.csv      # Rf — ACTIVO
+    │   └── euribor_tasas_diarias_2014_2025.csv                # Rf sin corregir (trazabilidad)
+    ├── raw/                            # Descargas anuales de Refinitiv (2015-2025)
+    │   ├── stoxx600_DEFENSA_YYYY.csv              # Panel diario base por año
+    │   ├── stoxx600_PTB_CONSOLIDADO_YYYY.csv      # Price-to-Book consolidado
+    │   ├── stoxx600_PTB_y_ROAS_diario_YYYY.csv    # PTB y ROA diarios
+    │   └── RICS_FALTANTES_PTB_ROA.csv
+    ├── consolidados/                   # CONSOLIDADO_YYYY.csv — insumo directo del notebook
     └── README.md                       # Instrucciones de reproducción
 ```
 
@@ -134,10 +156,11 @@ Se utiliza STOXX 600 **Net Return** en lugar de Price Return:
 
 ## 📖 Cómo Leer Este Repositorio
 
-1. **Para una visión rápida:** lee esta sección y consulta `presentation/`
-2. **Para metodología:** ve a `scripts/` y lee comentarios de cada archivo
-3. **Para reproducción:** sigue instrucciones en `notebooks/README.md`
-4. **Para data:** revisa `data/README.md` para obtener datos consolidados
+1. **Para el trabajo completo:** lee la tesis final en `thesis/` (Word y PDF)
+2. **Para una visión rápida:** lee esta sección y consulta `presentation/`
+3. **Para metodología:** ve a `scripts/` y lee comentarios de cada archivo
+4. **Para reproducción:** sigue instrucciones en `notebooks/README.md` — todas las bases de datos necesarias están incluidas en `data/`
+5. **Para data:** revisa `data/README.md` para la descripción de cada archivo
 
 ## 📝 Citas
 
@@ -172,5 +195,5 @@ Si encuentras errores o tienes sugerencias, abre un **Issue** o contacta a [estu
 
 ---
 
-**Última actualización:** 16 de junio de 2026  
-**Estado:** Análisis completo, resultados auditados, ready for publication
+**Última actualización:** 14 de julio de 2026  
+**Estado:** Tesis final entregada — análisis completo, robustez H3 incluida, bases de datos publicadas
